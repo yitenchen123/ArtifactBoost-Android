@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: Build debug APK
+    name: Build debug + release APKs
     runs-on: ubuntu-latest
 
     steps:
@@ -32,11 +32,18 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build with Gradle
-        run: ./gradlew :app:assembleDebug --stacktrace
+        run: ./gradlew :app:assembleDebug :app:assembleRelease --stacktrace
 
-      - name: Upload APK
+      - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: ArtifactBoost-debug-apk
           path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArtifactBoost-release-apk
+          path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error

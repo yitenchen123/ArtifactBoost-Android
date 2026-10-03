@@ -98,7 +98,7 @@ fun RootScreen() {
             when (selected) {
                 // 内部栈到底了就让系统处理（退出 App）
                 RootTab.Repos -> ReposTabNavHost(onBackAtRoot = { false })
-                RootTab.Search -> SearchScreen()
+                RootTab.Search -> SearchTabNavHost(onBackAtRoot = { false })
                 RootTab.Downloads -> DownloadsScreen()
                 RootTab.Settings -> SettingsScreen()
             }
@@ -130,6 +130,99 @@ private fun ReposTabNavHost(onBackAtRoot: () -> Boolean) {
     NavHost(navController = navController, startDestination = "repos") {
         composable("repos") {
             RepoListScreen(
+                onOpenRepo = { repo ->
+                    repoById[repo.fullName] = repo
+                    navController.navigate("repo/${java.net.URLEncoder.encode(repo.fullName, "UTF-8")}")
+                },
+            )
+        }
+
+        composable(
+            route = "repo/{fullName}",
+            arguments = listOf(navArgument("fullName") { type = NavType.StringType }),
+        ) { entry ->
+            val fullName = java.net.URLDecoder.decode(
+                entry.arguments?.getString("fullName").orEmpty(),
+                "UTF-8",
+            )
+            val repo = repoById[fullName] ?: return@composable
+
+            RepoDetailScreen(
+                repo = repo,
+                onBack = { navController.popBackStack() },
+                onOpenRun = { run ->
+                    runById["${repo.fullName}#${run.id}"] = run
+                    navController.navigate("run/${java.net.URLEncoder.encode(repo.fullName, "UTF-8")}/${run.id}")
+                },
+                onOpenRelease = { release ->
+                    releaseById["${repo.fullName}#${release.id}"] = release
+                    navController.navigate("release/${java.net.URLEncoder.encode(repo.fullName, "UTF-8")}/${release.id}")
+                },
+            )
+        }
+
+        composable(
+            route = "run/{fullName}/{runId}",
+            arguments = listOf(
+                navArgument("fullName") { type = NavType.StringType },
+                navArgument("runId") { type = NavType.LongType },
+            ),
+        ) { entry ->
+            val fullName = java.net.URLDecoder.decode(
+                entry.arguments?.getString("fullName").orEmpty(),
+                "UTF-8",
+            )
+            val runId = entry.arguments?.getLong("runId") ?: return@composable
+            val repo = repoById[fullName] ?: return@composable
+            val run = runById["$fullName#$runId"] ?: return@composable
+
+            RunDetailScreen(repo = repo, run = run, onBack = { navController.popBackStack() })
+        }
+
+        composable(
+            route = "release/{fullName}/{releaseId}",
+            arguments = listOf(
+                navArgument("fullName") { type = NavType.StringType },
+                navArgument("releaseId") { type = NavType.LongType },
+            ),
+        ) { entry ->
+            val fullName = java.net.URLDecoder.decode(
+                entry.arguments?.getString("fullName").orEmpty(),
+                "UTF-8",
+            )
+            val releaseId = entry.arguments?.getLong("releaseId") ?: return@composable
+            val repo = repoById[fullName] ?: return@composable
+            val release = releaseById["$fullName#$releaseId"] ?: return@composable
+
+            ReleaseDetailScreen(repo = repo, release = release, onBack = { navController.popBackStack() })
+        }
+    }
+}
+
+/**
+ * 搜索 tab 的导航栈：搜索 → 仓库详情 → 构建详情 / 发行版详情。
+ * 之前这里直接放 SearchScreen()（onOpenRepo 默认空实现），
+ * 导致直接打开和搜索结果点击都跳不动；与 iOS 版 NavigationStack 对齐，各 tab 独立栈。
+ */
+@Composable
+private fun SearchTabNavHost(onBackAtRoot: () -> Boolean) {
+    val navController = rememberNavController()
+
+    /** 页面之间传引用：导航只用 id，数据从这份缓存里取 */
+    val repoById = remember { mutableMapOf<String, GHRepo>() }
+    val runById = remember { mutableMapOf<String, GHWorkflowRun>() }
+    val releaseById = remember { mutableMapOf<String, GHRelease>() }
+
+    // 系统侧滑 / 返回键先交给这条内部导航栈消费，栈底时才上抛给外层
+    BackHandler(enabled = true) {
+        if (!navController.popBackStack()) {
+            onBackAtRoot()
+        }
+    }
+
+    NavHost(navController = navController, startDestination = "search") {
+        composable("search") {
+            SearchScreen(
                 onOpenRepo = { repo ->
                     repoById[repo.fullName] = repo
                     navController.navigate("repo/${java.net.URLEncoder.encode(repo.fullName, "UTF-8")}")

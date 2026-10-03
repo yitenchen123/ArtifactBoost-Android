@@ -72,6 +72,10 @@ import com.artifactboost.app.ui.theme.AppTheme
 import com.artifactboost.app.util.formatSpeed
 import com.artifactboost.app.util.formatTimestamp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+
+/** 设置页一次测速的总限时：找目标 20s + 逐通道测速 15s + 余量 */
+private const val SPEED_TEST_TOTAL_TIMEOUT_MS = 35_000L
 
 /**
  * 设置：账户 + 加速设置（并发 / 通道）+ 通道测速 + 关于。
@@ -115,33 +119,50 @@ fun SettingsScreen() {
         testFailed = false
 
         try {
-            val target = downloads.findTestTarget()
-            if (target == null) {
+            // 总限时：找目标与逐通道测速各自还有子超时，这里是最后一道保险；
+            // 超时后按已有部分结果结算，避免转圈一分钟以上。
+            val timedOut = withTimeoutOrNull(SPEED_TEST_TOTAL_TIMEOUT_MS) {
+                val target = downloads.findTestTarget()
+                if (target == null) {
+                    testFailed = true
+                    testMessage = "没找到可用的测速对象：至少需要一个跑过 Actions 的仓库（有产物或日志）。"
+                    return@withTimeoutOrNull false
+                }
+
+                testTargetLabel = target.label
+                var candidates = settings.candidateRoutes(target.isPrivate)
+                if (target.isPrivate) candidates = listOf(DownloadRoute.DIRECT)
+
+                val measured = RouteProbe.measureAll(candidates, target.url, knownSize = target.size)
+                testResults = measured
+
+                val best = measured.firstOrNull()
+                if (best == null) {
+                    testFailed = true
+                    testMessage = "测速失败：所有通道都没取到数据，请检查网络后重试。"
+                    return@withTimeoutOrNull false
+                }
+
+                persist(settings.record(best.route, best.speed))
+                var text = "已保存：${if (best.route.isDirect) "直连" else best.route.name} · ${formatSpeed(best.speed)}"
+                if (target.isPrivate) {
+                    text += "（测速对象来自私有仓库，只测了直连，不会把地址交给镜像）"
+                }
+                if (measured.size < candidates.size) {
+                    text += "（部分通道超时已跳过）"
+                }
+                testMessage = text
+                false
+            }
+            if (timedOut == null) {
                 testFailed = true
-                testMessage = "没找到可用的测速对象：至少需要一个跑过 Actions 的仓库（有产物或日志）。"
-                return@runSpeedTest
+                if (testResults.isEmpty()) {
+                    testMessage = "测速超时（35s）：所有通道都太慢，已取消，请换网络后重试。"
+                } else {
+                    // 已有部分结果时上面已 persist 最快通道，这里只补一句说明
+                    testMessage = (testMessage ?: "已保存最快通道") + "（整体超时，部分慢通道已跳过）"
+                }
             }
-
-            testTargetLabel = target.label
-            var candidates = settings.candidateRoutes(target.isPrivate)
-            if (target.isPrivate) candidates = listOf(DownloadRoute.DIRECT)
-
-            val measured = RouteProbe.measureAll(candidates, target.url, knownSize = target.size)
-            testResults = measured
-
-            val best = measured.firstOrNull()
-            if (best == null) {
-                testFailed = true
-                testMessage = "测速失败：所有通道都没取到数据，请检查网络后重试。"
-                return@runSpeedTest
-            }
-
-            persist(settings.record(best.route, best.speed))
-            var text = "已保存：${if (best.route.isDirect) "直连" else best.route.name} · ${formatSpeed(best.speed)}"
-            if (target.isPrivate) {
-                text += "（测速对象来自私有仓库，只测了直连，不会把地址交给镜像）"
-            }
-            testMessage = text
         } finally {
             isTesting = false
         }

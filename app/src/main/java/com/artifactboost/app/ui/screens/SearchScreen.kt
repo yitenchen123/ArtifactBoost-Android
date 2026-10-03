@@ -253,15 +253,42 @@ fun SearchScreen(onOpenRepo: (GHRepo) -> Unit = {}) {
 fun parseFullName(raw: String): String? {
     var text = raw.trim()
     if (text.isEmpty()) return null
+    // 从 Markdown 里复制时常见的 <https://github.com/owner/repo> 包裹
+    if (text.startsWith("<") && text.endsWith(">") && text.length >= 2) {
+        text = text.substring(1, text.length - 1).trim()
+        if (text.isEmpty()) return null
+    }
+
+    val lower = text.lowercase()
+    val looksLikeUrl = text.contains("://") || lower.contains("github.com")
+    if (!looksLikeUrl) {
+        // 裸 owner/repo 分支：之前实现强制要求 host 含 github.com，
+        // 导致最常见的 "cli/cli" 输入永远返回 null，这就是直接打开无效的主因。
+        val clean = text.substringBefore('?').substringBefore('#').trim()
+        val parts = clean.split('/').map { it.trim() }.filter { it.isNotEmpty() }
+        if (parts.size < 2) return null
+        val owner = parts[0]
+        var repo = parts[1]
+        if (repo.lowercase().endsWith(".git")) repo = repo.dropLast(4)
+        if (!isValidRepoPart(owner) || !isValidRepoPart(repo)) return null
+        return "$owner/$repo"
+    }
+
     if (!text.contains("://")) text = "https://$text"
 
     // 不依赖 java.net.URL：host 解析更宽松，兼容没有 scheme 的输入
     val withoutScheme = text.substringAfter("://")
-    val host = withoutScheme.substringBefore('/').substringBefore('?').lowercase()
+    val host = withoutScheme.substringBefore('/').substringBefore('?').substringBefore('#').lowercase()
     if (!host.contains("github.com")) return null
 
     val path = withoutScheme.substringAfter('/', "").substringBefore('?').substringBefore('#')
     val parts = path.split('/').filter { it.isNotBlank() }
     if (parts.size < 2) return null
-    return "${parts[0]}/${parts[1]}"
+    var repo = parts[1]
+    if (repo.lowercase().endsWith(".git")) repo = repo.dropLast(4)
+    if (!isValidRepoPart(parts[0]) || !isValidRepoPart(repo)) return null
+    return "${parts[0]}/$repo"
 }
+
+private val RepoNamePart = Regex("^[A-Za-z0-9_.-]+$")
+private fun isValidRepoPart(s: String): Boolean = RepoNamePart.matches(s)

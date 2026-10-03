@@ -24,6 +24,9 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // CI/开源兜底：先用 debug key 把 release 签上，保证开箱即用、可安装。
+            // 需要发商店时再换成正式 keystore（见 README 签名小节）。
+            signingConfig = signingConfigs.getByName("debug")
         }
         debug {
             applicationIdSuffix = ".debug"

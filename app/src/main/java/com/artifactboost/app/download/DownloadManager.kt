@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
 /** 测速用的真实目标（优先产物，其次构建日志） */
@@ -149,7 +150,19 @@ class DownloadManager(
     }
 
     /** 设置页测速用：在用户自己的仓库里找一个真实的下载目标 */
-    suspend fun findTestTarget(): SpeedTestTarget? {
+    suspend fun findTestTarget(): SpeedTestTarget? =
+        withTimeoutOrNull(FIND_TARGET_TIMEOUT_MS) { findTestTargetUnsafe() }
+
+    /**
+     * 找测速目标限时：内部是串行网络请求（仓库→构建→产物→签名地址），
+     * 弱网下单个请求就可能卡 20~30s，整体不限时会让设置页转圈一分钟以上。
+     * 超时直接返回 null，调用方按“无可用目标”提示。
+     */
+    private companion object {
+        const val FIND_TARGET_TIMEOUT_MS = 20_000L
+    }
+
+    private suspend fun findTestTargetUnsafe(): SpeedTestTarget? {
         val client = session.client.value ?: return null
         val repos = try {
             client.repos(page = 1)

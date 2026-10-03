@@ -3,9 +3,13 @@ package com.artifactboost.app.data
 import android.content.Context
 import android.content.SharedPreferences
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeout
 import java.net.URLEncoder
+import java.util.Collections
 
 /**
  * 通道的作用域：决定它能套在哪种 URL 上。
@@ -241,6 +245,14 @@ object RouteProbe {
     private const val TIMEOUT_MS = 8_000L
 
     /**
+     * 测速限时机制：
+     * 单通道 8s（OkHttp callTimeout），整体默认 15s。
+     * 整体超时时不再死等最慢的那条，直接返回已完成通道的部分结果；
+     * 调用方（设置页/下载前）按“部分结果”继续选路，空结果则回退直连。
+     */
+    const val TOTAL_TIMEOUT_MS = 15_000L
+
+    /**
      * 探测专用客户端：限制总时长，
      * 防止某个通道不认 Range 时把整个文件都拉进内存。
      */
@@ -254,10 +266,11 @@ object RouteProbe {
     }
 
     /**
-     * 逐条通道测速，返回按速度从快到慢排序的结果（失败的通道会被丢掉）。
+     * 逐条通道测速，返回按速度从快到慢排序的结果（失败/超时的通道会被丢掉）。
      *
      * @param githubUrl 该下载在 github.com 上的稳定地址；ghfast 这类
      *        [RouteScope.GITHUB_ONLY] 通道只能用它测。
+     * @param timeoutMillis 整体限时；超时后取消未完成通道并返回部分结果。
      */
     suspend fun measureAll(
         routes: List<DownloadRoute>,
@@ -265,18 +278,35 @@ object RouteProbe {
         githubUrl: String? = null,
         /** 已知体积时从中间取样；未知就从头开始 */
         knownSize: Long? = null,
+        timeoutMillis: Long = TOTAL_TIMEOUT_MS,
         onResult: (ScoredRoute) -> Unit = {},
     ): List<ScoredRoute> = coroutineScope {
-        val results = routes.map { route ->
+        if (routes.isEmpty()) return@coroutineScope emptyList()
+        // 边完成边收割：超时后也能保留快通道的结果，而不是整体置空
+        val collected = Collections.synchronizedList(mutableListOf<ScoredRoute>())
+        val deferreds = routes.map { route ->
             async(Dispatchers.IO) {
                 val target = when (route.scope) {
                     RouteScope.ANY -> signedUrl
                     RouteScope.GITHUB_ONLY -> githubUrl ?: return@async null
                 }
-                measure(route, target, knownSize = knownSize)?.also(onResult)
+                val scored = measure(route, target, knownSize = knownSize)
+                if (scored != null) {
+                    collected.add(scored)
+                    onResult(scored)
+                }
+                scored
             }
-        }.mapNotNull { it.await() }
-        results.sortedByDescending { it.speed }
+        }
+        try {
+            withTimeout(timeoutMillis) {
+                deferreds.awaitAll()
+            }
+        } catch (_: TimeoutCancellationException) {
+            // 整体超时：砍掉还在爬的慢通道，快通道的结果已在 collected 里
+            deferreds.forEach { it.cancel() }
+        }
+        collected.sortedByDescending { it.speed }
     }
 
     /** 单通道测速，失败返回 null */
