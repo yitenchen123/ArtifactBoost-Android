@@ -230,19 +230,32 @@ fun DownloadItemRow(
                         Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = colors.green, modifier = Modifier.size(16.dp))
                         Text("下载完成", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = colors.strongText)
                     }
+                    if (state.publicPath != null) {
+                        Text("已保存到系统目录：${state.publicPath}", fontSize = 11.sp, color = colors.muted)
+                    }
                     if (summary != null) {
                         Text(summary, fontSize = 11.sp, color = colors.muted)
+                    } else if (state.publicPath == null) {
+                        Text("公共目录写入失败，已保留在 App 私有目录，可手动导出。", fontSize = 11.sp, color = colors.muted)
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Button(
-                            onClick = { shareFile(context, state.file) },
+                            onClick = {
+                                val uri = state.publicUri
+                                if (uri != null) sharePublicUri(context, uri, state.file.name)
+                                else shareFile(context, state.file)
+                            },
                             modifier = Modifier.weight(1f),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = colors.blue,
                                 contentColor = Color.White,
                             ),
                         ) {
-                            Text("导出 / 保存到文件", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                if (state.publicUri != null) "分享 / 打开系统文件" else "导出 / 保存到文件",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
                         }
                         com.artifactboost.app.ui.components.IconBadgeButton(
                             icon = Icons.Filled.Refresh,

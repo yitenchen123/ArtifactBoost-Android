@@ -1,6 +1,7 @@
 package com.artifactboost.app.download
 
 import android.content.Context
+import android.net.Uri
 import com.artifactboost.app.data.AccelerationSettings
 import com.artifactboost.app.data.DownloadItem
 import com.artifactboost.app.data.DownloadRoute
@@ -22,6 +23,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import kotlin.coroutines.coroutineContext
@@ -40,7 +42,14 @@ sealed class DownloadState {
     data object Idle : DownloadState()
     data object Resolving : DownloadState()
     data class Downloading(val progress: DownloadProgress) : DownloadState()
-    data class Finished(val file: File) : DownloadState()
+    data class Finished(
+        /** 私有暂存目录里的原始文件（引擎直写，多线程落盘用） */
+        val file: File,
+        /** 系统公共下载目录里的副本（`Download/ArtifactBoost/`），发布失败时为 null */
+        val publicUri: Uri? = null,
+        /** 展示用相对路径，例如 `Download/ArtifactBoost/xxx.zip` */
+        val publicPath: String? = null,
+    ) : DownloadState()
     data class Failed(val message: String) : DownloadState()
 }
 
@@ -69,7 +78,7 @@ class DownloadManager(
     private val engines = mutableMapOf<String, DownloadEngine>()
     private val jobs = mutableMapOf<String, Job>()
 
-    /** 已下载文件的落盘目录：外部私有目录/Artifacts，可从「文件」App 访问 */
+    /** 引擎落盘用的私有暂存目录；完成后会自动复制一份到系统公共下载目录 */
     val outputDir: File
         get() = File(appContext.getExternalFilesDir(null) ?: appContext.filesDir, "Artifacts")
             .also { it.mkdirs() }
@@ -108,7 +117,20 @@ class DownloadManager(
         jobs[item.id] = scope.launch {
             try {
                 val file = performDownload(item, client, engine, settings)
-                _states.value = _states.value + (item.id to DownloadState.Finished(file))
+                // 默认保存到安卓系统公共目录：私有暂存完成后复制一份到
+                // Download/ArtifactBoost/（10+ 走 MediaStore，无需权限；7~9 直写）。
+                // 发布失败也不影响本次下载，保留私有文件兜底。
+                val published = withContext(Dispatchers.IO) {
+                    runCatching { PublicDownloads.publish(appContext, file) }.getOrNull()
+                }
+                if (published != null) {
+                    val prev = _routeSummary.value[item.id]
+                    val saved = "已保存到 ${published.displayPath}"
+                    setRouteSummary(item.id, if (prev.isNullOrBlank()) saved else "$prev · $saved")
+                }
+                _states.value = _states.value + (
+                    item.id to DownloadState.Finished(file, published?.uri, published?.displayPath)
+                    )
             } catch (e: Exception) {
                 if (isCancellation(e)) {
                     _states.value = _states.value + (item.id to DownloadState.Idle)

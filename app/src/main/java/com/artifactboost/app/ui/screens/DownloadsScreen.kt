@@ -140,7 +140,7 @@ fun DownloadsScreen() {
 
                 item {
                     Text(
-                        "文件保存在 App 私有目录 Artifacts/ 下，也可以通过「导出 / 保存」分享到其他 App。",
+                        "文件默认保存到系统 Download/ArtifactBoost/，可在文件管理器中查看；也可点「分享」发到其他 App。",
                         fontSize = 11.sp,
                         color = colors.subtle,
                     )

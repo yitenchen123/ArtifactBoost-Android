@@ -176,7 +176,7 @@ export ANDROID_HOME=/path/to/android-sdk
 3. 进「仓库」选一个仓库 → 切到「构建 / 正式版 / 源码」→ 点下载。
 4. 想更快：进「设置」→ 测速并保存最快通道 → 回到仓库继续下载。
 
-下载完成的文件在 **`Android/data/com.artifactboost.app/files/Artifacts/`**，也可以在下载卡片上点「导出」通过系统分享面板发到别处。
+下载完成的文件默认保存到系统公共目录 **`Download/ArtifactBoost/`**（文件管理器可直接查看），也可在下载卡片上点「分享」发到别处。App 私有目录 `Android/data/.../files/Artifacts/` 仅作引擎多线程落盘的暂存。
 
 ---
 

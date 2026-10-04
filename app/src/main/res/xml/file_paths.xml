@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <!-- 已下载的产物放在应用私有外部目录的 Artifacts/ 下 -->
+    <!-- 引擎暂存：应用私有外部目录的 Artifacts/ 下 -->
     <external-files-path name="artifacts" path="Artifacts/" />
     <files-path name="internal_artifacts" path="Artifacts/" />
     <cache-path name="cache" path="." />
+    <!-- Android 7~9 发布到系统公共 Download/ArtifactBoost/ 后的分享兜底 -->
+    <external-path name="public_download" path="Download/ArtifactBoost/" />
 </paths>
