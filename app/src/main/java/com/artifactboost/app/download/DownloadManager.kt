@@ -5,10 +5,9 @@ import android.net.Uri
 import com.artifactboost.app.data.AccelerationSettings
 import com.artifactboost.app.data.DownloadItem
 import com.artifactboost.app.data.DownloadRoute
-import com.artifactboost.app.data.DownloadSource
 import com.artifactboost.app.data.GitHubClient
 import com.artifactboost.app.data.GitHubException
-import com.artifactboost.app.data.RouteProbe
+import com.artifactboost.app.data.RouteMode
 import com.artifactboost.app.data.RouteScope
 import com.artifactboost.app.data.ScoredRoute
 import com.artifactboost.app.data.SessionManager
@@ -27,15 +26,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import kotlin.coroutines.coroutineContext
-
-/** 测速用的真实目标（优先产物，其次构建日志） */
-data class SpeedTestTarget(
-    val url: String,
-    val label: String,
-    val isPrivate: Boolean,
-    /** 已知体积：测速时从文件中部取样，避开 TCP 慢启动 */
-    val size: Long? = null,
-)
 
 /** 单个下载任务的状态 */
 sealed class DownloadState {
@@ -174,17 +164,7 @@ class DownloadManager(
         }
     }
 
-    /** 设置页测速用：在用户自己的仓库里找一个真实的下载目标 */
-    suspend fun findTestTarget(): SpeedTestTarget? =
-        withTimeoutOrNull(FIND_TARGET_TIMEOUT_MS) { findTestTargetUnsafe() }
-
-    /**
-     * 找测速目标限时：内部是串行网络请求（仓库→构建→产物→签名地址），
-     * 弱网下单个请求就可能卡 20~30s，整体不限时会让设置页转圈一分钟以上。
-     * 超时直接返回 null，调用方按“无可用目标”提示。
-     */
     private companion object {
-        const val FIND_TARGET_TIMEOUT_MS = 20_000L
 
         /**
          * 解析签名地址单次限时：该阶段永远直连 api.github.com，
@@ -194,52 +174,6 @@ class DownloadManager(
 
         /** 解析重试前退避：抖动网络下立刻重打大概率再撞上，歇 1.5s 再试更划算 */
         const val RESOLVE_RETRY_DELAY_MS = 1_500L
-    }
-
-    private suspend fun findTestTargetUnsafe(): SpeedTestTarget? {
-        val client = session.client.value ?: return null
-        val repos = try {
-            client.repos(page = 1)
-        } catch (_: Exception) {
-            return null
-        }
-        // 公开仓库优先：私有仓库的签名地址不应该交给镜像去测速
-        val ordered = repos.sortedWith(
-            compareBy({ if (it.isPrivate) 1 else 0 }, { it.name }),
-        )
-        for (repo in ordered.take(5)) {
-            val runs = try {
-                client.workflowRuns(repo)
-            } catch (_: Exception) {
-                continue
-            }
-            val run = runs.firstOrNull() ?: continue
-
-            val candidate = try {
-                client.artifacts(repo, run)
-                    .filter { !it.expired }
-                    .maxByOrNull { it.sizeInBytes }
-            } catch (_: Exception) {
-                null
-            }
-            if (candidate != null) {
-                try {
-                    val url = client.resolveDownloadUrl(
-                        DownloadSource.Artifact(repo.fullName, candidate.id),
-                    )
-                    return SpeedTestTarget(url, "${repo.name} · ${candidate.name}", repo.isPrivate, candidate.sizeInBytes)
-                } catch (_: Exception) {
-                    // 换日志再试
-                }
-            }
-            try {
-                val url = client.resolveDownloadUrl(DownloadSource.RunLogs(repo.fullName, run.id))
-                return SpeedTestTarget(url, "${repo.name} · 构建日志", repo.isPrivate)
-            } catch (_: Exception) {
-                // 换下一个仓库
-            }
-        }
-        return null
     }
 
     // MARK: - 下载主流程
@@ -276,7 +210,7 @@ class DownloadManager(
                         "解析下载地址超时（30s）：直连 api.github.com 太慢，请检查网络后重试",
                     )
                 }
-                // 解析成功：清掉可能存在的“重试…”文案，后面测速/下载会刷自己的说明
+                // 解析成功：清掉可能存在的“重试…”文案，后面下载会刷自己的说明
                 _routeSummary.value = _routeSummary.value - item.id
                 return runDownload(item, engine, signed, settings)
             } catch (e: Exception) {
@@ -300,46 +234,14 @@ class DownloadManager(
         // 所以「这条通道该套哪个 URL」必须逐条算，不能统一用 signedUrl。
         val githubUrl = item.source.ghfastEligibleUrl
 
-        var plan: List<ScoredRoute>
-        var note: String
-
-        val saved = settings.savedPlan(item.isPrivate, githubUrl)
-        if (saved != null) {
-            // 设置页已经测过速：直接用保存的最快通道
-            plan = saved
-            note = "${saved[0].route.name}（设置页测速 ${formatSpeed(saved[0].speed)}）"
+        // 无测速：候选通道直接全部并行，初始权重均等，
+        // 引擎下载中按实时吞吐动态调整分配。
+        val candidates = settings.candidateRoutes(item.isPrivate, githubUrl)
+        val plan: List<ScoredRoute> = candidates.map { ScoredRoute(it, 1.0) }
+        val note: String = if (item.isPrivate && settings.mode == RouteMode.SMART) {
+            "直连（私有仓库不走镜像）"
         } else {
-            val candidates = settings.candidateRoutes(item.isPrivate, githubUrl)
-            if (candidates.size <= 1) {
-                plan = listOf(ScoredRoute(candidates[0], 1.0))
-                note = if (item.isPrivate && settings.mode == com.artifactboost.app.data.RouteMode.SMART) {
-                    "直连（私有仓库不走镜像）"
-                } else {
-                    candidates[0].name
-                }
-            } else {
-                setRouteSummary(item.id, "正在测速选通道…")
-                val measured = RouteProbe.measureAll(
-                    candidates,
-                    signedUrl = signedUrl,
-                    githubUrl = githubUrl,
-                    knownSize = item.size,
-                )
-                val fastest = measured.firstOrNull()?.speed ?: 0.0
-                val viable = measured.filter { it.speed >= fastest * 0.4 }
-                if (viable.isEmpty()) {
-                    plan = listOf(ScoredRoute(DownloadRoute.DIRECT, 1.0))
-                    note = "直连（测速失败）"
-                } else {
-                    plan = viable
-                    note = describe(plan) + "（实测 ${formatSpeed(fastest)}）"
-                    if (settings.mode == com.artifactboost.app.data.RouteMode.SMART) {
-                        // 顺手把结果存下来，下次下载和设置页都能直接复用
-                        val best = measured.first()
-                        settings.record(best.route, best.speed).save(appContext)
-                    }
-                }
-            }
+            describe(plan)
         }
 
         val connections = settings.clampedConnections

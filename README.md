@@ -16,7 +16,6 @@ GitHub Actions 产物加速下载器。**多线程 + HTTP Range 分段并发 + �
 | **构建详情** | 构建日志 + 该次运行的全部产物，一键盘下载 |
 | **正式版详情** | Release 附件 + 对应 tag 的源码包 |
 | **下载管理** | 进度、实时速度、通道说明、取消 / 重试 / 完成后导出分享 |
-| **通道测速** | 拿真实下载目标逐条通道测速，保存最快的，24h 内复用 |
 | **前台服务** | 下载在通知栏持续运行，锁屏 / 切后台不中断 |
 
 ---
@@ -74,22 +73,17 @@ GitHub Actions 产物加速下载器。**多线程 + HTTP Range 分段并发 + �
    否则界面会一直挂着峰值速度、而实际早就掉下去了。
 
 10. **私有仓库强制直连**
-    私有仓库的签名地址绝不交给第三方镜像。测速对象来自私有仓库时也只测直连。
-
-11. **测速结果短期复用**
-    测速结果缓存 **4 小时**（旧实现是 24 小时）。
-    一条早上测出来的「快通道」到晚上可能早就被限流，
-    直接沿用会让下载起步看着还行、很快掉速 —— 所以过时了就重测。
+    私有仓库的签名地址绝不交给第三方镜像。
 
 ---
 
-## 下载通道
+## 下载通道（设置 → 下载源，一点即切换并保存）
 
-- **直连**：直接连 GitHub 存储，最安全，但国内通常很慢。
-- **智能加速**：在直连与内置公共镜像（gh-proxy.com / slink.ltd / hk.gh-proxy.com / moeyy.xyz）之间自动测速，选最快的；多通道并行时带宽可以叠加。
-- **自定义**：填你自己搭建的中转前缀（Cloudflare Worker / 反向代理）。
+- **官方源**：直接连 GitHub 存储，最安全，但国内通常很慢。
+- **镜像加速**：直连与内置公共镜像（gh-proxy.com / slink.ltd / hk.gh-proxy.com / moeyy.xyz）多通道并行，带宽叠加。
+- **自建中转**：打开开关后填你自己搭建的中转前缀（Cloudflare Worker / 反向代理）；前缀为空时回退直连。
 
-> 说明：智能加速与自定义通道会让产物数据经过第三方中转（**只中转已签名的产物地址，不接触你的 Token**）。私有仓库始终强制直连。
+> 说明：镜像加速与自建中转会让产物数据经过第三方中转（**只中转已签名的产物地址，不接触你的 Token**）。私有仓库始终强制直连。
 
 ---
 
@@ -121,7 +115,7 @@ app/src/main/java/com/artifactboost/app/
 ├─ data/
 │  ├─ GitHubModels.kt         # @Serializable 数据模型
 │  ├─ GitHubClient.kt         # REST 调用 + 302 解析（resolveDownloadUrl）
-│  ├─ DownloadRoute.kt        # 通道定义 / 加速设置 / 通道测速
+│  ├─ DownloadRoute.kt        # 通道定义 / 加速设置
 │  ├─ DownloadItem.kt         # 可下载项与来源类型
 │  ├─ TokenStore.kt           # 加密存储 Token
 │  └─ SessionManager.kt       # 登录态
@@ -174,7 +168,7 @@ export ANDROID_HOME=/path/to/android-sdk
    - 快速创建：https://github.com/settings/tokens/new?scopes=repo,workflow&description=ArtifactBoost
 2. Token 只保存在本机（加密存储），所有请求直连 `api.github.com`。
 3. 进「仓库」选一个仓库 → 切到「构建 / 正式版 / 源码」→ 点下载。
-4. 想更快：进「设置」→ 测速并保存最快通道 → 回到仓库继续下载。
+4. 如需更快：在「设置」里调大并发连接数后重新下载。
 
 下载完成的文件默认保存到系统公共目录 **`Download/ArtifactBoost/`**（文件管理器可直接查看），也可在下载卡片上点「分享」发到别处。App 私有目录 `Android/data/.../files/Artifacts/` 仅作引擎多线程落盘的暂存。
 

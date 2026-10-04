@@ -56,17 +56,6 @@ class DownloadRouteTest {
     }
 
     @Test
-    fun `保存的 ghfast 测速结果只在有 github 地址时可用`() {
-        val recorded = AccelerationSettings(mode = RouteMode.SMART)
-            .record(DownloadRoute.GHFAST, 5_000_000.0)
-
-        // 发行版：地址齐全，可以沿用
-        assertTrue(recorded.savedPlan(isPrivateRepo = false, githubUrl = githubUrl) != null)
-        // 构建产物：没有 github 地址，ghfast 不在候选里，不能沿用（否则会拿签名地址去套）
-        assertTrue(recorded.savedPlan(isPrivateRepo = false, githubUrl = null) == null)
-    }
-
-    @Test
     fun `直连永远在所有模式下保留兜底`() {
         RouteMode.entries.forEach { mode ->
             val settings = AccelerationSettings(mode = mode)

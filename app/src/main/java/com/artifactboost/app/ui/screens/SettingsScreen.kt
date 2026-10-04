@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -22,12 +23,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
-import androidx.compose.material.icons.automirrored.filled.TrendingUp
-import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Person
-import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
@@ -35,6 +33,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -43,20 +42,18 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalUriHandler
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -65,24 +62,13 @@ import com.artifactboost.app.ArtifactBoostApp
 import com.artifactboost.app.data.AccelerationSettings
 import com.artifactboost.app.data.DownloadRoute
 import com.artifactboost.app.data.RouteMode
-import com.artifactboost.app.data.RouteProbe
-import com.artifactboost.app.data.ScoredRoute
 import com.artifactboost.app.ui.components.CardSurface
 import com.artifactboost.app.ui.components.Hairline
 import com.artifactboost.app.ui.components.IconBadge
-import com.artifactboost.app.ui.components.InlineBanner
-import com.artifactboost.app.ui.components.StatusPill
 import com.artifactboost.app.ui.theme.AppTheme
-import com.artifactboost.app.util.formatSpeed
-import com.artifactboost.app.util.formatTimestamp
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
-
-/** 设置页一次测速的总限时：找目标 20s + 逐通道测速 15s + 余量 */
-private const val SPEED_TEST_TOTAL_TIMEOUT_MS = 35_000L
 
 /**
- * 设置：账户 + 加速设置（并发 / 通道）+ 通道测速 + 关于。
+ * 设置：账户 + 加速设置（并发 / 通道）+ 关于。
  * 对应 iOS 版的 SettingsView。
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
@@ -91,24 +77,16 @@ fun SettingsScreen() {
     val colors = AppTheme.colors
     val app = ArtifactBoostApp.instance
     val session = app.session
-    val downloads = app.downloads
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
     val haptics = LocalHapticFeedback.current
-    val scope = rememberCoroutineScope()
 
     val user by session.user.collectAsStateWithLifecycle()
 
     var settings by remember { mutableStateOf(AccelerationSettings.load(context)) }
     // 原神彩蛋兜底入口：长按顶部「设置」标题同样触发（底部 Tab 手势若被系统消费时仍可发现）
     var showGenshinEgg by remember { mutableStateOf(false) }
-    var isTesting by remember { mutableStateOf(false) }
-    var testResults by remember { mutableStateOf<List<ScoredRoute>>(emptyList()) }
-    var testTargetLabel by remember { mutableStateOf<String?>(null) }
-    var testMessage by remember { mutableStateOf<String?>(null) }
-    var testFailed by remember { mutableStateOf(false) }
 
-    // 下载过程中可能自动记录过测速结果，回到设置页时同步一下
     LaunchedEffect(Unit) {
         settings = AccelerationSettings.load(context)
     }
@@ -116,63 +94,6 @@ fun SettingsScreen() {
     fun persist(updated: AccelerationSettings) {
         settings = updated
         updated.save(context)
-    }
-
-    // 用局部 val 而不是 fun：必须在 Scaffold 之前定义，onClick 才捕获得到
-    val runSpeedTest: suspend () -> Unit = runSpeedTest@{
-        isTesting = true
-        testResults = emptyList()
-        testMessage = null
-        testFailed = false
-
-        try {
-            // 总限时：找目标与逐通道测速各自还有子超时，这里是最后一道保险；
-            // 超时后按已有部分结果结算，避免转圈一分钟以上。
-            val timedOut = withTimeoutOrNull(SPEED_TEST_TOTAL_TIMEOUT_MS) {
-                val target = downloads.findTestTarget()
-                if (target == null) {
-                    testFailed = true
-                    testMessage = "没找到可用的测速对象：至少需要一个跑过 Actions 的仓库（有产物或日志）。"
-                    return@withTimeoutOrNull false
-                }
-
-                testTargetLabel = target.label
-                var candidates = settings.candidateRoutes(target.isPrivate)
-                if (target.isPrivate) candidates = listOf(DownloadRoute.DIRECT)
-
-                val measured = RouteProbe.measureAll(candidates, target.url, knownSize = target.size)
-                testResults = measured
-
-                val best = measured.firstOrNull()
-                if (best == null) {
-                    testFailed = true
-                    testMessage = "测速失败：所有通道都没取到数据，请检查网络后重试。"
-                    return@withTimeoutOrNull false
-                }
-
-                persist(settings.record(best.route, best.speed))
-                var text = "已保存：${if (best.route.isDirect) "直连" else best.route.name} · ${formatSpeed(best.speed)}"
-                if (target.isPrivate) {
-                    text += "（测速对象来自私有仓库，只测了直连，不会把地址交给镜像）"
-                }
-                if (measured.size < candidates.size) {
-                    text += "（部分通道超时已跳过）"
-                }
-                testMessage = text
-                false
-            }
-            if (timedOut == null) {
-                testFailed = true
-                if (testResults.isEmpty()) {
-                    testMessage = "测速超时（35s）：所有通道都太慢，已取消，请换网络后重试。"
-                } else {
-                    // 已有部分结果时上面已 persist 最快通道，这里只补一句说明
-                    testMessage = (testMessage ?: "已保存最快通道") + "（整体超时，部分慢通道已跳过）"
-                }
-            }
-        } finally {
-            isTesting = false
-        }
     }
 
     Scaffold(
@@ -291,169 +212,83 @@ fun SettingsScreen() {
                                 }
                             }
 
-                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text("下载通道", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = colors.strongText)
-                                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                                    RouteMode.entries.forEachIndexed { index, mode ->
-                                        SegmentedButton(
-                                            selected = settings.mode == mode,
-                                            onClick = {
-                                                persist(settings.copy(mode = mode))
-                                                testResults = emptyList()
-                                                testMessage = null
-                                            },
-                                            shape = SegmentedButtonDefaults.itemShape(
-                                                index = index,
-                                                count = RouteMode.entries.size,
-                                            ),
-                                        ) { Text(mode.title, fontSize = 12.sp) }
-                                    }
-                                }
-                            }
-
-                            if (settings.mode == RouteMode.CUSTOM) {
-                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Text("加速前缀", fontSize = 12.sp, color = colors.muted)
-                                    OutlinedTextField(
-                                        value = settings.customPrefix,
-                                        onValueChange = { persist(settings.copy(customPrefix = it)) },
-                                        placeholder = { Text("https://你的中转地址/", fontSize = 13.sp) },
-                                        singleLine = true,
-                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                                        modifier = Modifier.fillMaxWidth(),
-                                    )
-                                }
-                            }
-
                             Hairline()
 
-                            Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                                Text(settings.mode.detail, fontSize = 11.sp, color = colors.subtle)
-                                Text(
-                                    "并发数越大越能跑满带宽；绿色网络环境建议 32~64，一般 16 即可，千兆内网/高速 Wi-Fi 可试 128。被限流时引擎会自动退让并把活儿转给健康通道，不会失败。设置会自动保存，下载时直接生效。",
-                                    fontSize = 11.sp,
-                                    color = colors.subtle,
-                                )
-                            }
+                            Text(
+                                "并发数越大越能跑满带宽；绿色网络环境建议 32~64，一般 16 即可，千兆内网/高速 Wi-Fi 可试 128。被限流时引擎会自动退让并把活儿转给健康通道，不会失败。设置会自动保存，下载时直接生效。",
+                                fontSize = 11.sp,
+                                color = colors.subtle,
+                            )
                         }
                     }
                 }
             }
 
-            // MARK: - 通道测速
+            // MARK: - 下载源
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    SettingsHeader("通道测速")
+                    SettingsHeader("下载源")
                     CardSurface {
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                SourceButton(
+                                    title = "官方源",
+                                    subtitle = "直连 GitHub",
+                                    icon = Icons.Filled.Cloud,
+                                    selected = settings.mode == RouteMode.DIRECT,
+                                    accent = colors.blue,
+                                    onClick = { persist(settings.copy(mode = RouteMode.DIRECT)) },
+                                )
+                                SourceButton(
+                                    title = "镜像加速",
+                                    subtitle = "多通道并行 · 推荐",
+                                    icon = Icons.Filled.Bolt,
+                                    selected = settings.mode == RouteMode.SMART,
+                                    accent = colors.green,
+                                    onClick = { persist(settings.copy(mode = RouteMode.SMART)) },
+                                )
+                            }
+
+                            Hairline()
+
                             Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .clickable(enabled = !isTesting) {
-                                        scope.launch { runSpeedTest() }
-                                    }
-                                    .padding(vertical = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                Icon(
-                                    Icons.AutoMirrored.Filled.TrendingUp,
-                                    contentDescription = null,
-                                    tint = colors.blue,
-                                    modifier = Modifier.size(18.dp),
-                                )
-                                Text(
-                                    "测速并保存最快通道",
-                                    fontSize = 14.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = if (isTesting) colors.subtle else colors.strongText,
-                                )
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text("自建中转", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = colors.strongText)
+                                    Text("用自己的反代地址下载", fontSize = 11.sp, color = colors.subtle)
+                                }
                                 Spacer(Modifier.weight(1f))
-                                if (isTesting) {
-                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                                }
-                            }
-
-                            val testedRoute = settings.testedRoute
-                            val testedAt = settings.testedAtMillis
-                            if (testedRoute != null && testedAt != null) {
-                                Hairline()
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                ) {
-                                    IconBadge(
-                                        if (testedRoute.isDirect) Icons.Filled.CheckCircle else Icons.Filled.Cloud,
-                                        if (testedRoute.isDirect) colors.orange else colors.green,
-                                        size = 32.dp,
-                                    )
-                                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                        Text(
-                                            if (testedRoute.isDirect) "直连" else testedRoute.name,
-                                            fontSize = 13.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = colors.strongText,
+                                Switch(
+                                    checked = settings.mode == RouteMode.CUSTOM,
+                                    onCheckedChange = { enabled ->
+                                        persist(
+                                            settings.copy(
+                                                mode = if (enabled) RouteMode.CUSTOM else RouteMode.SMART,
+                                            ),
                                         )
-                                        Text(
-                                            "已保存 · ${formatSpeed(settings.testedSpeed)} · ${formatTimestamp(testedAt)}",
-                                            fontSize = 11.sp,
-                                            color = colors.subtle,
-                                        )
-                                    }
-                                    Spacer(Modifier.weight(1f))
-                                    StatusPill("当前使用", colors.green)
-                                }
-                            }
-
-                            if (testResults.isNotEmpty()) {
-                                Hairline()
-                                testResults.forEachIndexed { index, result ->
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                    ) {
-                                        IconBadge(
-                                            if (result.route.isDirect) Icons.Filled.CheckCircle else Icons.Filled.Cloud,
-                                            if (result.route.isDirect) colors.orange else colors.blue,
-                                            size = 30.dp,
-                                        )
-                                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                            Text(
-                                                if (result.route.isDirect) "直连" else result.route.name,
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = colors.strongText,
-                                            )
-                                            testTargetLabel?.let {
-                                                Text(it, fontSize = 11.sp, color = colors.subtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                            }
-                                        }
-                                        Spacer(Modifier.weight(1f))
-                                        Text(
-                                            formatSpeed(result.speed),
-                                            fontSize = 12.sp,
-                                            fontFamily = FontFamily.Monospace,
-                                            color = if (index == 0) colors.green else colors.muted,
-                                        )
-                                    }
-                                }
-                            }
-
-                            val message = testMessage
-                            if (message != null) {
-                                InlineBanner(
-                                    message,
-                                    if (testFailed) colors.orange else colors.green,
-                                    if (testFailed) Icons.Filled.Warning else Icons.Filled.CheckCircle,
+                                    },
                                 )
                             }
 
-                            Text(
-                                "测速会拿一个真实的下载目标（优先用你自己仓库里最新的构建产物）分别测试每条通道，把最快的保存下来。之后所有下载都直接用它，不用每次现测。",
-                                fontSize = 11.sp,
-                                color = colors.subtle,
-                            )
+                            if (settings.mode == RouteMode.CUSTOM) {
+                                OutlinedTextField(
+                                    value = settings.customPrefix,
+                                    onValueChange = { persist(settings.copy(customPrefix = it)) },
+                                    placeholder = { Text("https://你的中转地址/", fontSize = 13.sp) },
+                                    singleLine = true,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                                if (DownloadRoute.normalizedPrefix(settings.customPrefix).isEmpty()) {
+                                    Text("前缀为空时将回退直连", fontSize = 11.sp, color = colors.orange)
+                                }
+                            }
+
+                            Hairline()
+
+                            Text(settings.mode.detail, fontSize = 11.sp, color = colors.subtle)
                         }
                     }
                 }
@@ -523,4 +358,43 @@ private fun SettingsHeader(title: String) {
         color = colors.muted,
         modifier = Modifier.padding(start = 4.dp),
     )
+}
+
+/** 下载源大按钮：选中时按语义色高亮，未选中时灰边。可复用给官方源 / 镜像加速。 */
+@Composable
+private fun RowScope.SourceButton(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    selected: Boolean,
+    accent: androidx.compose.ui.graphics.Color,
+    onClick: () -> Unit,
+) {
+    val colors = AppTheme.colors
+    val shape = RoundedCornerShape(12.dp)
+    Column(
+        modifier = Modifier
+            .weight(1f)
+            .clip(shape)
+            .background(if (selected) accent.copy(alpha = 0.12f) else colors.canvas)
+            .border(1.5.dp, if (selected) accent else colors.border, shape)
+            .clickable(onClick = onClick)
+            .padding(vertical = 12.dp, horizontal = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Icon(
+            icon,
+            contentDescription = null,
+            tint = if (selected) accent else colors.muted,
+            modifier = Modifier.size(22.dp),
+        )
+        Text(
+            title,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (selected) accent else colors.strongText,
+        )
+        Text(subtitle, fontSize = 11.sp, color = colors.subtle)
+    }
 }
