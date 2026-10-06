@@ -145,12 +145,17 @@ class SlicePoolBackoffTest {
     fun `退避中的区间不阻塞其它可用区间被取走`() {
         val total = 8L * 1024 * 1024
         val pool = SlicePool(total)
-        val a = pool.take()!!
-        pool.putBack(a, backoffMs = 5_000L)     // 前一个失败片，退避中
-        pool.putBack(Chunk(0, 0L, total - 1))   // 另一个正常区间（插在队首）
+        // 先把整段取出来，再切成互不重叠的两段还回去
+        val whole = pool.take()!!
+        val half = whole.length / 2
+
+        // 后半段带退避（模拟失败片），前半段正常可用
+        pool.putBack(Chunk(0, whole.start + half, whole.end), backoffMs = 5_000L)
+        pool.putBack(Chunk(0, whole.start, whole.start + half - 1))
 
         val work = pool.take()
         assertNotNull("退避的条目不该挡住正常条目", work)
-        assertEquals("应当拿到那个可用的区间", 0L, work!!.start)
+        assertEquals("应当拿到那个可用的区间（前半段）", 0L, work!!.start)
+        assertEquals("拿到的应当是前半段", whole.start + half - 1, work.end)
     }
 }
