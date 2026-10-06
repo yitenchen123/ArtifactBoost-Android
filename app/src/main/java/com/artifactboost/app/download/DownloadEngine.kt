@@ -119,6 +119,13 @@ sealed class DownloadException(message: String) : IOException(message) {
     object Cancelled : DownloadException("下载已取消")
     object Incomplete : DownloadException("下载失败：数据校验不通过（可能断流），请重试")
 
+    /**
+     * 下载完成但**字节覆盖校验**没过：有区间缺口或重复写入。
+     * 带上账本给出的差异描述，方便用户/日志定位（而不是只说一句「校验不通过」）。
+     */
+    class IncompleteDetailed(detail: String) :
+        DownloadException("下载失败：文件字节校验不通过（$detail），请重试")
+
     /** 服务器忽略 Range 头（回 200 全量）：这条地址不能用于分段下载 */
     object NoRange : DownloadException("下载失败：该通道不支持分段下载")
 
@@ -415,6 +422,11 @@ class DownloadEngine {
             val result = segmentDownload(urls, total, outFile, tempDir, lanes, plan, progress)
             val elapsed = maxOf((System.nanoTime() - startedAt) / 1_000_000_000.0, 0.05)
             DownloadResult(result, total / elapsed, lanes)
+        } catch (e: Throwable) {
+            // 失败时把半成品删掉：留着它只会让用户以为「下载成功了」，
+            // 拿去解压才发现损坏。宁可让他看到明确的失败提示再重试。
+            runCatching { outFile.delete() }
+            throw e
         } finally {
             tempDir.deleteRecursively()
         }
@@ -473,9 +485,19 @@ class DownloadEngine {
 
         val sessionClients = (0 until sessionCount).map {
             OkHttpClient.Builder()
-                .connectTimeout(30, TimeUnit.SECONDS)
-                .readTimeout(120, TimeUnit.SECONDS)
-                .callTimeout(0, TimeUnit.MILLISECONDS) // 不设总时长上限：大文件要慢慢下
+                .connectTimeout(15, TimeUnit.SECONDS)
+                // **关键**：readTimeout 是 idle 超时，但 CDN 的心跳字节会不断重置它。
+                // 以前设 120s + callTimeout=0（不设总时长上限），后果是：
+                // 一条挂住的连接能把一个 worker 卡住两分钟，而线程池恰好只有
+                // lanes 条线程 —— 全被卡住时新活儿根本派不下去，这就是
+                // 「卡住」残留的根源之一。
+                //
+                // 现在改成：readTimeout 收到 30s，并给每次分片请求设
+                // **总时长上限** sliceTimeout（按分片大小推算，见 sliceTimeoutMillis）。
+                // 双重保险之下，最坏情况也只是丢掉这一片、换线重试，
+                // 而不是整条下载僵在那里。
+                .readTimeout(30, TimeUnit.SECONDS)
+                .callTimeout(0, TimeUnit.MILLISECONDS) // 具体上限由每个调用单独设
                 .followRedirects(true)
                 // 只走 HTTP/1.1：避免 h2 把所有请求挤进一条 TCP
                 .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
@@ -492,10 +514,15 @@ class DownloadEngine {
 
         // 关键：Dispatchers.IO 默认最多 64 条线程。lanes 超过 64 时，多出来的
         // worker 会一直排在 IO 池队列里等线程 —— 「选了 512 却只跑 64」的元凶就是它。
-        // 所以给本次下载建一个专属固定线程池：runSlice 里全是阻塞 IO
+        // 所以给本次下载建一个专属线程池：runSlice 里全是阻塞 IO
         // （execute() + 写盘），每条车道独占一条线程最直接，下载结束整体回收。
+        //
+        // **线程数 = lanes + 富余量**：给那些「正卡在旧连接上、马上要被掐掉」的
+        // worker 留出替补线程，否则线程池被卡住的 job 占满时，新活儿根本派不下去
+        //（那正是「卡住之后再也恢复不了」的成因）。
         // （声明在 try 外面：finally 里要 close 它。）
-        val enginePool = Executors.newFixedThreadPool(lanes).asCoroutineDispatcher()
+        val enginePool = Executors.newFixedThreadPool(lanes + THREAD_POOL_HEADROOM)
+            .asCoroutineDispatcher()
 
         try {
             val direct = urls.first()
@@ -518,6 +545,11 @@ class DownloadEngine {
             // 预切分 lanes*4：首轮就能派满并发，避免“池子只有 1 个区间→只能派出 1 条”的调度饿死（与 iOS 同步）。
             val pool = SlicePool(total, lanes * 4)
             val written = AtomicLong(0)
+            // 覆盖账本：记录「哪些字节真的被写进文件了」。
+            // 以前的完整性校验只有 written == total（总量），
+            // 「重复写一段 + 漏写一段」的总量可能相等 —— 文件大小对、内容错，
+            // 表现就是「能下完但解压不了」。这个账本把校验升级成覆盖校验。
+            val ledger = WriteLedger(total)
             val startedAt = System.nanoTime()
 
             // 车道编号只增不减：worker 收工后编号不复用，
@@ -640,6 +672,7 @@ class DownloadEngine {
                                     total = total,
                                     output = output,
                                     written = written,
+                                    ledger = ledger,
                                     accumulator = accumulator,
                                     inflight = inflight,
                                     board = board,
@@ -675,7 +708,103 @@ class DownloadEngine {
                     jobs.forEach { it.cancel() }
                 }
 
-                if (written.get() != total) throw DownloadException.Incomplete
+                // 完整性校验：不只是「总量对」，而是「每个字节恰好被写过一次」。
+                //
+                // 老实现只有 written.get() != total 这一句，而总量相等并不能保证
+                // 内容正确（重复写一段 + 漏写一段，总量照样相等）——
+                // 症状就是「能下完但解压不了」。
+                //
+                // 不过「校验不过就直接判死」有点粗暴：多数情况下只是个别区间
+                // 因为连接抖动没落盘。这里补一轮**缺口修复**——把账本里还没覆盖的
+                // 区间重新塞回池子再下一次，能救回来的就不该让用户重下几百 MB。
+                var repairRound = 0
+                while (!ledger.isComplete() && repairRound < MAX_REPAIR_ROUNDS) {
+                    if (cancelled || DownloadEngineFlag.cancelled) throw DownloadException.Cancelled
+
+                    val gaps = ledger.gaps(limit = MAX_REPAIR_RANGES)
+                    if (gaps.isEmpty()) break
+                    repairRound++
+                    board.stalled = false
+                    // 重置失败计数：上一轮主循环可能已经攒满了失败预算，
+                    // 不重置的话这一轮补漏的第一次失败就会直接掀桌
+                    // （而补漏恰恰是最需要「允许零星失败」的场景）。
+                    pool.failures.set(0)
+
+                    // 把缺口塞回池子（退避 0，立刻可派）
+                    gaps.forEach { gap ->
+                        pool.putBack(Chunk(0, gap.first, gap.last))
+                    }
+
+                    // 重跑一轮调度，把缺口补完
+                    coroutineScope {
+                        val repairJobs = mutableListOf<Job>()
+                        val repairLimiter = AdaptiveConcurrency(ceiling = minOf(lanes, 32))
+                        val repairWatchdog = StallWatchdog(STALL_WINDOW_MS)
+                        var repairRoundRobin = 0
+                        var lastGapBytes = ledger.coveredBytes
+                        var lastGapAt = System.nanoTime()
+
+                        while (true) {
+                            if (cancelled || DownloadEngineFlag.cancelled) throw DownloadException.Cancelled
+                            repairJobs.removeAll { it.isCompleted }
+
+                            val coveredNow = ledger.coveredBytes
+                            if (coveredNow != lastGapBytes) {
+                                lastGapBytes = coveredNow
+                                lastGapAt = System.nanoTime()
+                            } else if (repairJobs.isNotEmpty() &&
+                                (System.nanoTime() - lastGapAt) > 30_000_000_000L
+                            ) {
+                                break // 补漏这一轮没进展，交给下一轮或最终报错
+                            }
+
+                            var dispatched = false
+                            while (repairJobs.size < repairLimiter.currentWindow &&
+                                repairLimiter.canDispatch(repairJobs.size)
+                            ) {
+                                val work = pool.take() ?: break
+                                val channel = channels[repairRoundRobin % channels.size]
+                                repairRoundRobin++
+                                repairLimiter.noteDispatch()
+                                val captured = channels.toList()
+                                repairJobs += launch(enginePool) {
+                                    runSlice(
+                                        laneId = laneCounter.getAndIncrement(),
+                                        channel = channel,
+                                        channels = captured,
+                                        initial = work,
+                                        pool = pool,
+                                        lanes = minOf(lanes, 32),
+                                        total = total,
+                                        output = output,
+                                        written = written,
+                                        ledger = ledger,
+                                        accumulator = accumulator,
+                                        inflight = inflight,
+                                        board = board,
+                                        watchdog = repairWatchdog,
+                                        limiter = repairLimiter,
+                                    )
+                                }
+                                dispatched = true
+                            }
+
+                            // 完成判定：没有在跑的 job、池子里也没有可取的活儿
+                            // （注意不能在这里调 pool.take() —— 它有副作用，
+                            //   取了不还就等于丢了一个区间，会造成新的缺口）
+                            if (repairJobs.isEmpty() && pool.backlog == 0) {
+                                break
+                            }
+                            if (!dispatched && repairJobs.isEmpty()) delay(100L)
+                            else if (!dispatched) delay(60L)
+                        }
+                        repairJobs.forEach { it.cancel() }
+                    }
+                }
+
+                if (!ledger.isComplete() || written.get() != total) {
+                    throw DownloadException.IncompleteDetailed(ledger.describe())
+                }
                 runCatching { output.fd.sync() }
             } finally {
                 runCatching { output.close() }
@@ -808,6 +937,17 @@ class DownloadEngine {
                                 }
                             }
                         }
+
+                        // **关键校验**：单连接路径以前从不检查「到底下完了没有」——
+                        // 连接中途断流时 read 会返回 -1，循环安静退出，文件被截断，
+                        // 却照样报告「下载完成」。解压时才发现文件不完整。
+                        // 这里必须比对声明的 Content-Length。
+                        if (total > 0 && done != total) {
+                            throw DownloadException.IncompleteDetailed(
+                                "单连接下载被截断：只收到 $done / $total 字节",
+                            )
+                        }
+                        if (done == 0L) throw DownloadException.Incomplete
 
                         progress(
                             DownloadProgress(
@@ -943,8 +1083,11 @@ class DownloadEngine {
          * 卡住看门狗窗口（毫秒）：有连接在飞、但超过这段时间一个字节都没落盘，
          * 就判定卡住并强制重建所有在飞请求。CDN 的心跳字节会让 OkHttp 的
          * readTimeout 永不触发，所以必须用「有没有真的写进文件」来判。
+         *
+         * 从 12s 收紧到 8s：每个分片请求现在都有总时长上限兜底，8 秒没有任何
+         * 字节落盘已经能确定是卡住，再等下去只是白白占着线程。
          */
-        const val STALL_WINDOW_MS = 12_000L
+        const val STALL_WINDOW_MS = 8_000L
 
         /** 引擎并发上限（与 AccelerationSettings.MAX_CONNECTIONS 一致）。
          *  注意这只是**上限**：真正的在飞并发由 [AdaptiveConcurrency] 的 AIMD 窗口决定，
@@ -957,6 +1100,46 @@ class DownloadEngine {
         /** 小于这个体积不做分段：切来切去不如一条连接拉完 */
         const val MIN_CHUNKED_TOTAL = 4L * 1024 * 1024
 
+        /**
+         * 缺口修复的最大轮数。
+         *
+         * 主循环跑完后若账本显示还有没覆盖的字节，就把缺口重新派下去再跑一轮。
+         * 3 轮足够吃掉「个别区间因连接抖动没落盘」这类问题；
+         * 若 3 轮还补不上，多半是源端真有问题，继续重试只是浪费用户时间。
+         */
+        const val MAX_REPAIR_ROUNDS = 3
+
+        /** 单轮修复最多处理多少个缺口区间（防止极端碎片化时爆炸） */
+        const val MAX_REPAIR_RANGES = 512
+
+        /**
+         * 线程池的富余线程数。
+         *
+         * 卡住恢复时，被掐掉的 worker 还要一点时间才真正退出；
+         * 如果池子刚好等于 lanes 条线程，新派下去的活儿会一直排队等线程 ——
+         * 表现为「掐掉之后恢复不了、一直干等」。留出富余量就能立刻补位。
+         */
+        const val THREAD_POOL_HEADROOM = 8
+
+        /**
+         * 单片可接受的最低平均速度：低于它就不是「慢」、是「卡住」。
+         * 用于推算单片的总时长上限（与 iOS 端一致）。
+         */
+        const val MIN_ACCEPTABLE_SLICE_SPEED = 50L * 1024   // 50 KB/s
+
+        /**
+         * 单片的总时长上限（毫秒）。
+         *
+         * 按「最低可接受速度」反推：64KB 片约 1.3s（但设了 20s 下限兜住小片），
+         * 4MB 片约 80s。命中后 OkHttp 抛 IOException，走既有重试换线逻辑，
+         * 把区间让给快通道 —— 而不是攥着它干等。
+         *
+         * 下限 20s 是为了：小片本来就快，不该因为偶尔 RTT 抖动被误杀；
+         * 上限 80s 是为了：哪怕真的慢，也不让一个 worker 挂到天荒地老。
+         */
+        fun sliceTimeoutMillis(length: Long): Long =
+            maxOf(20_000L, length * 1000L / MIN_ACCEPTABLE_SLICE_SPEED)
+
         /** 探测专用客户端：限制总时长，防止某个通道不认 Range 时把整个文件都拉进内存。
          *  超时从 15s 收紧到 8s：探测只该花一个 RTT，超过就说明这条通道不行，
          *  让别的通道先出结果，而不是把整段下载卡在这一条上。 */
@@ -967,6 +1150,44 @@ class DownloadEngine {
                 .callTimeout(12, TimeUnit.SECONDS)
                 .followRedirects(true)
                 .build()
+        }
+
+        /**
+         * 校验 `Content-Range` 是否真的对应我们请求的字节区间。
+         *
+         * 形如 `bytes 4194304-8388607/10485760`。
+         *
+         * 两道检查：
+         *  1. 起止偏移必须与请求完全一致 —— 防止镜像「自作主张」返回别的区间
+         *     （返回码仍是 206），那种数据写到当前偏移就是静默损坏；
+         *  2. 总长度（`/` 后面那段）应当与已知总大小一致 —— 防止下载过程中
+         *     源端文件被替换（GitHub 上很少见，但镜像缓存错乱时会遇到）。
+         *
+         * 拿不到头时返回 false：宁可换一条通道重试，也不冒险写错位置。
+         */
+        fun contentRangeMatches(headers: Headers, expectedStart: Long, expectedEnd: Long): Boolean {
+            val raw = headers.get("Content-Range")?.trim() ?: return false
+            // 期望格式：bytes <start>-<end>/<total>（total 也可能是 *）
+            val spec = raw.removePrefix("bytes").trim().removePrefix("=").trim()
+            if (spec.isEmpty()) return false
+            val slash = spec.indexOf('/')
+            val rangePart = if (slash >= 0) spec.substring(0, slash) else spec
+            val dash = rangePart.indexOf('-')
+            if (dash <= 0) return false
+
+            val start = rangePart.substring(0, dash).trim().toLongOrNull() ?: return false
+            val end = rangePart.substring(dash + 1).trim().toLongOrNull() ?: return false
+            if (start != expectedStart || end != expectedEnd) return false
+
+            // 总长度若是具体数字，必须大于等于我们请求的终点（不一致说明文件变了）
+            if (slash >= 0) {
+                val totalPart = spec.substring(slash + 1).trim()
+                if (totalPart != "*") {
+                    val total = totalPart.toLongOrNull() ?: return false
+                    if (total <= expectedEnd) return false
+                }
+            }
+            return true
         }
 
         fun retryAfter(headers: Headers): Long? {
@@ -1074,6 +1295,7 @@ private suspend fun runSlice(
     total: Long,
     output: RandomAccessFile,
     written: AtomicLong,
+    ledger: WriteLedger,
     accumulator: ProgressAccumulator,
     inflight: CallRegistry,
     board: LaneBoard,
@@ -1180,10 +1402,16 @@ private suspend fun runSlice(
 
         if (outcome.received > 0) {
             writeAt(output, from, outcome.data, outcome.received)
-            written.addAndGet(outcome.received.toLong())
-            pool.recordDone(outcome.received.toLong())
+            // 登记覆盖区间：只有**真的写进文件**的字节才算数。
+            // 账本会在这里发现重复写入（overlaps > 0），收尾校验据此判死。
+            val newlyCovered = ledger.record(from, from + outcome.received - 1)
+            // 进度按「新覆盖的字节」计，而不是「收到的字节」——
+            // 重复写入不该让进度条虚涨（否则会出现进度 100% 但校验不过）。
+            written.addAndGet(newlyCovered)
+            pool.recordDone(newlyCovered)
             watchdog.noteProgress(outcome.received.toLong())
-            accumulator.advance(outcome.received.toLong())
+            // 进度推进同样按「新覆盖的字节」：重复写入时不虚涨
+            accumulator.advance(newlyCovered)
             winner.observe(outcome.elapsedNanos, outcome.received.toLong())
             board.doneSlices.incrementAndGet()
             board.reward(winner.name)
@@ -1309,17 +1537,51 @@ private suspend fun fetchSlice(
             // lanes 超过 64 时会把实际并发钉死在 64。
             // Call 登记后 cancel() 依然能立刻打断阻塞中的 execute()。
             // 注意用 active.client：本轮可能已换线，用初始通道的连接池就串线了。
-            val call = active.client.newCall(request)
+            //
+            // **总时长上限**：在共享客户端的基础上，给这一个 Call 单独设 callTimeout。
+            // readTimeout 只管 idle，心跳字节能让它永不触发；callTimeout 是硬上限，
+            // 到点必抛，保证「最坏情况只是丢这一片」，不会让 worker 无限期挂住。
+            val perCallTimeoutMs = DownloadEngine.sliceTimeoutMillis(chunk.length)
+            val callClient = active.client.newBuilder()
+                .callTimeout(perCallTimeoutMs, TimeUnit.MILLISECONDS)
+                .build()
+            val call = callClient.newCall(request)
             inflight.register(call)
             val data = try {
                 call.execute().use { response ->
+                    // 本片应当落在文件里的绝对偏移（从 0 计数）
+                    val expectedStart = chunk.start
+                    val expectedEnd = chunk.end
+
                     when (response.code) {
-                        206 -> Unit
+                        206 -> {
+                            // **关键校验**：确认服务器真的按我们请求的区间返回。
+                            //
+                            // 有些镜像/CDN 对 Range 支持不完整（忽略部分区间、
+                            // 或从自己理解的偏移开始返回），返回码仍是 206。
+                            // 不校验 Content-Range 的话，取到的数据会被写到
+                            // 错误偏移上 —— 下载"成功"、文件大小也对，但内容错了，
+                            // 表现就是「能下完但解压不了」。这类静默损坏必须在这里拦住。
+                            if (!DownloadEngine.contentRangeMatches(response.headers, expectedStart, expectedEnd)) {
+                                throw DownloadException.NoRange
+                            }
+                        }
                         200 -> {
                             // 服务器忽略了 Range（回 200 全量）：除了 start==0，
                             // 读到的都是文件头的数据，写到 chunk.start 偏移就是损坏文件。
                             // 当作这条地址不支持分段，换条线重试。
-                            if (chunk.start != 0L) throw DownloadException.NoRange
+                            if (expectedStart != 0L) throw DownloadException.NoRange
+                            // 即便 start==0，也必须确认服务器回的是**整个文件**。
+                            // 若 Content-Length 小于文件总体积，说明响应被中间层截断，
+                            // 我们从它读到的前 N 字节虽然偏移正确，但后面缺失的部分
+                            // 不能再从这个响应里补 —— 直接丢弃本片，交给缺片重派逻辑
+                            // 用真正的 Range 请求去补。
+                            val declared = response.header("Content-Length")?.toLongOrNull()
+                            if (declared != null && declared < expectedEnd + 1) {
+                                // 这一片只能拿到一部分，且是 200（无法继续往后读）
+                                // → 当作不支持 Range，换线/换策略重试
+                                throw DownloadException.NoRange
+                            }
                         }
                         429, 503 -> {
                             pool.throttles.incrementAndGet()
