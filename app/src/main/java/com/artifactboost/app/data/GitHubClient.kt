@@ -194,6 +194,11 @@ class GitHubClient(val token: String) {
      *
      * GitHub 对这些接口都会 302 跳转到带签名的真实地址，这里拦下跳转拿真实地址，
      * 后续分段下载直接打这个地址（不再需要 Token，也不再经过 api.github.com）。
+     *
+     * 提速要点：
+     *  1. 先用 **HEAD** 拿跳转（不产生正文传输），失败再退回 GET；
+     *  2. `followRedirects = false` + 拿到 3xx 就立刻结束 —— 产物是几百 MB 的资源，
+     *     走完整个响应体纯属浪费，302 一出现 Location 就有了。
      */
     suspend fun resolveDownloadUrl(source: DownloadSource): String = withContext(Dispatchers.IO) {
         val extraHeaders = mutableMapOf<String, String>()
@@ -213,21 +218,42 @@ class GitHubClient(val token: String) {
             }
         }
 
-        val builder = authorizedRequest(makeUrl(path))
-        extraHeaders.forEach { (key, value) -> builder.header(key, value) }
+        val url = makeUrl(path)
+        var lastError: Throwable = GitHubException.DownloadUrlNotFound
 
-        redirectClient.newCall(builder.build()).execute().use { response ->
-            if (response.code == 410) throw GitHubException.ArtifactExpired
-            // 302/303 带着 Location，就是我们要的签名地址
-            if (response.code == 302 || response.code == 303) {
-                val location = response.header("Location")
-                if (!location.isNullOrBlank()) return@withContext location
+        // 先试 HEAD（最快，不产生正文传输），拿不到 302 再退回 GET
+        for ((index, method) in listOf("HEAD", "GET").withIndex()) {
+            val builder = authorizedRequest(url)
+            builder.method(method, null)
+            extraHeaders.forEach { (key, value) -> builder.header(key, value) }
+
+            try {
+                redirectClient.newCall(builder.build()).execute().use { response ->
+                    if (response.code == 410) throw GitHubException.ArtifactExpired
+                    // 302/303 带着 Location，就是我们要的签名地址
+                    if (response.code == 302 || response.code == 303) {
+                        val location = response.header("Location")
+                        if (!location.isNullOrBlank()) return@withContext location
+                    }
+                    if (!response.isSuccessful) {
+                        val code = response.code
+                        throw GitHubException.Http(code, errorMessage(response.body?.string().orEmpty()))
+                    }
+                    // 2xx 但没跳转：HEAD 不被支持，换 GET 再试一次
+                    lastError = GitHubException.DownloadUrlNotFound
+                }
+            } catch (e: GitHubException.ArtifactExpired) {
+                throw e // 明确结论，不做无谓的第二次请求
+            } catch (e: GitHubException.Http) {
+                // 鉴权/权限类错误直接抛出；其余留给下一次尝试
+                if (e.code == 401 || e.code == 403 || e.code == 404) throw e
+                lastError = e
+            } catch (e: Exception) {
+                lastError = e
             }
-            if (!response.isSuccessful) {
-                throw GitHubException.Http(response.code, errorMessage(response.body?.string().orEmpty()))
-            }
-            throw GitHubException.DownloadUrlNotFound
+            if (index == 1) break
         }
+        throw lastError
     }
 
     /**

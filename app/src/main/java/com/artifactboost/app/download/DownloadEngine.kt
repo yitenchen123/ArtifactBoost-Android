@@ -6,6 +6,8 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -99,6 +101,17 @@ data class DownloadDiagnostics(
     val routes: List<RouteStats>,
     /** 当前正在用的下载地址（可复制） */
     val activeUrl: String,
+    /**
+     * 自适应并发窗口：引擎自己爬到的「服务器愿意给的并发」。
+     * 用户设的是上限，这个值才是当前实际在用的档位。
+     */
+    val adaptiveWindow: Int = 0,
+    /** 是否检测到卡住（看门狗触发） */
+    val stalled: Boolean = false,
+    /** AIMD 窗口的涨/缩次数与峰值（诊断面板用） */
+    val windowIncreases: Int = 0,
+    val windowDecreases: Int = 0,
+    val windowPeak: Int = 0,
 )
 
 sealed class DownloadException(message: String) : IOException(message) {
@@ -186,7 +199,7 @@ private class CallRegistry {
  * 同时兼任「通道级并发配额」的计数：命中 429/503 的通道会被临时降额，
  * 免得在同一根被限流的线路上继续加压、越限越死。
  */
-private class LaneBoard(private val target: Int) {
+internal class LaneBoard(private val target: Int) {
 
     private val lanes = java.util.concurrent.ConcurrentHashMap<Int, LaneSnapshot>()
     private val routeNames = java.util.concurrent.ConcurrentHashMap<Int, String>()
@@ -201,6 +214,21 @@ private class LaneBoard(private val target: Int) {
     val splits = AtomicInteger(0)
 
     @Volatile var activeUrl: String = ""
+
+    /** 自适应窗口 / 卡住标志：由调度循环每拍写入，UI 直接读走 */
+    @Volatile var adaptiveWindow: Int = 0
+    @Volatile var stalled: Boolean = false
+    private val windowIncreases = AtomicInteger(0)
+    private val windowDecreases = AtomicInteger(0)
+    private val windowPeak = AtomicInteger(0)
+
+    /** 调度循环每拍把 AIMD 的实时状态同步进看板 */
+    fun syncWindow(current: Int, increases: Int, decreases: Int, peak: Int) {
+        adaptiveWindow = current
+        windowIncreases.set(increases)
+        windowDecreases.set(decreases)
+        windowPeak.set(peak)
+    }
 
     fun update(snapshot: LaneSnapshot) {
         lanes[snapshot.laneId] = snapshot
@@ -241,7 +269,41 @@ private class LaneBoard(private val target: Int) {
         splits = splits.get(),
         routes = routes,
         activeUrl = activeUrl,
+        adaptiveWindow = adaptiveWindow,
+        stalled = stalled,
+        windowIncreases = windowIncreases.get(),
+        windowDecreases = windowDecreases.get(),
+        windowPeak = windowPeak.get(),
     )
+}
+
+/**
+ * 「还没到 deadline 就已经不动了」的看门狗。
+ *
+ * OkHttp 的 readTimeout 是 **idle 超时**，理想情况下卡住的连接能自己超时。
+ * 但现实里两层代理/CDN 会持续吐心跳字节（KEEPALIVE），idle 计时器不断被重置，
+ * 那条连接就「看着在动、实际一动不动」地挂着 —— 用户看到的就是「时不时卡住」。
+ * 这里用「进度没涨」而不是「没收到字节」来判：只有真正写进文件的字节才重置计时器。
+ */
+private class StallWatchdog(private val stallWindowMs: Long = 12_000L) {
+    private val progress = AtomicLong(0)
+    private val lastProgressAt = AtomicLong(System.currentTimeMillis())
+
+    fun noteProgress(bytes: Long) {
+        progress.addAndGet(bytes)
+        lastProgressAt.set(System.currentTimeMillis())
+    }
+
+    val totalProgress: Long get() = progress.get()
+
+    val stalledForMs: Long get() = System.currentTimeMillis() - lastProgressAt.get()
+
+    val isStalled: Boolean get() = stalledForMs > stallWindowMs
+
+    /** 恢复进度（卡住后重新派活了，计时器重置） */
+    fun reset() {
+        lastProgressAt.set(System.currentTimeMillis())
+    }
 }
 
 /**
@@ -471,12 +533,13 @@ class DownloadEngine {
                     val jobs = mutableListOf<Job>()
                     var roundRobin = 0
 
-                    // 渐进建连：不再一上来就把 lanes 顶满。
-                    // 起步瞬间几百个请求同时砸过去，Azure/Cloudflare 会直接回 503 ServerBusy，
-                    // 一旦被限流就得指数退避，整段下载反而更慢。
-                    // 改成每 CONNECTION_RAMP_INTERVAL_MS 放一档，跑到目标并发后再全速调度。
-                    var allowedLanes = minOf(rampStepFor(lanes), lanes)
-                    var lastRampAt = System.nanoTime()
+                    // 自适应并发：窗口不再来自固定时间片的爬坡，而是 AIMD。
+                    // 顺畅时自己涨（≈ 用户设的上限封顶），命中限流立刻砍半。
+                    // 用户把并发拉到 128 只会让「上限」更高，不会真的盲目砸 128 条连接。
+                    val limiter = AdaptiveConcurrency(ceiling = lanes)
+                    // 卡住看门狗：12s 没有任何字节落盘就判定「卡住」并主动拆掉重连
+                    val watchdog = StallWatchdog(STALL_WINDOW_MS)
+                    var lastStallBreakAt = 0L
 
                     // 无进展保护：所有 worker 都在「失败→重派→再失败」里空转、
                     // 文件一个字节都没涨，这种状态持续 90 秒就判定全线失败。
@@ -488,11 +551,14 @@ class DownloadEngine {
                         // 取消后立刻退出调度循环，不再派新活儿
                         if (cancelled || DownloadEngineFlag.cancelled) throw DownloadException.Cancelled
 
+                        // 无进展保护。判据是「池子里还有活儿（在跑 或 在退避）却一直没涨」，
+                        // 不能只看 jobs 是否为空 —— 全部区间都在退避时 jobs 可能是空的，
+                        // 那种情况下同样不能永远等下去。
                         val nowProgress = written.get()
                         if (nowProgress != lastProgressBytes) {
                             lastProgressBytes = nowProgress
                             lastProgressAt = System.nanoTime()
-                        } else if (jobs.isNotEmpty() &&
+                        } else if ((jobs.isNotEmpty() || pool.deferredCount() > 0 || pool.backlog > 0) &&
                             (System.nanoTime() - lastProgressAt) > 90_000_000_000L
                         ) {
                             throw DownloadException.Incomplete
@@ -500,18 +566,33 @@ class DownloadEngine {
 
                         jobs.removeAll { it.isCompleted }
 
-                        // 0) 建连爬坡：到点就放开一档并发
-                        val nowNanos = System.nanoTime()
-                        if (allowedLanes < lanes &&
-                            (nowNanos - lastRampAt) / 1_000_000 >= CONNECTION_RAMP_INTERVAL_MS
+                        // 0) 卡住检测：有连接在飞、但一个字节都没落盘超过 STALL_WINDOW_MS。
+                        //
+                        // 这正是用户说的「时不时卡住」：CDN 的心跳字节让 OkHttp 的
+                        // readTimeout（idle 计时）永远不触发，那条连接就这么挂着。
+                        // 这里由看门狗主动出手 —— 掐掉所有在飞 Call，调度循环下一轮
+                        // 会用全新的连接重新派活；同时把窗口砍一刀，避免再扑上去撞同一堵墙。
+                        val stallNow = System.currentTimeMillis()
+                        if (jobs.isNotEmpty() && watchdog.isStalled &&
+                            stallNow - lastStallBreakAt > 5_000L
                         ) {
-                            allowedLanes = minOf(allowedLanes + rampStepFor(lanes), lanes)
-                            lastRampAt = nowNanos
+                            lastStallBreakAt = stallNow
+                            board.stalled = true
+                            inflight.cancelAll()
+                            limiter.noteFailure()
+                            watchdog.reset()
+                            lastProgressAt = System.nanoTime()
+                            delay(120L)
+                            continue
+                        } else if (!watchdog.isStalled) {
+                            board.stalled = false
                         }
 
                         // 1) 把并发顶到「当前允许值」；通道被限流时按配额收缩
                         var assigned = false
-                        while (jobs.size < allowedLanes) {
+                        limiter.snapshotInto(board)
+                        val windowNow = limiter.currentWindow
+                        while (jobs.size < windowNow && limiter.canDispatch(jobs.size)) {
                             // 此刻实际可用的并发额度：被限流的通道要临时降额，
                             // 免得在同一根已经饱和的线路上继续加压、越限越死。
                             val quota = channels.sumOf { channel ->
@@ -546,6 +627,7 @@ class DownloadEngine {
                                 ),
                             )
 
+                            limiter.noteDispatch()
                             val capturedChannels = channels.toList()
                             jobs += launch(enginePool) {
                                 runSlice(
@@ -561,17 +643,33 @@ class DownloadEngine {
                                     accumulator = accumulator,
                                     inflight = inflight,
                                     board = board,
+                                    watchdog = watchdog,
+                                    limiter = limiter,
                                 )
                                 board.remove(laneId)
                             }
                             assigned = true
                         }
 
-                        // 2) 全干完了
-                        if (jobs.isEmpty()) break
+                        // 2) 全干完了。
+                        // 注意要把「正在退避的区间」算作「还有活儿」：否则一个失败片
+                        // 正在退避、恰好所有 worker 都收工的那一刻，会被误判成完成而提前退出，
+                        // 最后文件缺一块（下面的 size 校验会抛 Incomplete，等于白下）。
+                        if (jobs.isEmpty() && pool.deferredCount() == 0 &&
+                            nextWork(pool, 0, lanes, total) == null
+                        ) {
+                            break
+                        }
 
                         // 3) 没活儿可派：等一小会儿再评估，别忙等烧 CPU
-                        if (!assigned) delay(delayFor(pool, jobs.size, lanes, startedAt))
+                        // 3) 没活儿可派：等一小会儿再评估，别忙等烧 CPU
+                        // 如果只是「区间都在失败退避中」，等的时间和退避对齐，
+                        // 否则会空转几十轮。
+                        if (!assigned && jobs.isEmpty()) {
+                            delay(120L)
+                        } else if (!assigned) {
+                            delay(delayFor(pool, jobs.size, lanes, startedAt))
+                        }
                     }
 
                     jobs.forEach { it.cancel() }
@@ -741,23 +839,33 @@ class DownloadEngine {
     private data class Probe(val total: Long, val chunked: Boolean)
 
     /**
-     * 探测文件大小：优先用 `Range: bytes=0-0`（返回 206 + Content-Range 才确认服务器支持分段），
-     * 失败再退回 HEAD。逐条通道尝试，任何一条成功即可。
+     * 探测文件大小：优先用 `Range: bytes=0-0`（返回 206 + Content-Range 才确认支持分段），
+     * 失败再退回 HEAD。**并发**打所有通道，谁先给出确定答案就用谁的 ——
+     * 老实现是逐条串行，第一条是死镜像时就得白等 15s 超时，这正是「开始下载慢」的一段。
      */
     private suspend fun probeSize(urls: List<String>): Probe? {
-        var headFallback: Long? = null
-        for (url in urls) {
-            val probe = probeSize(url) ?: continue
-            if (probe.chunked && probe.total > 0) return probe
-            if (headFallback == null && probe.total > 0) headFallback = probe.total
+        if (urls.isEmpty()) return null
+
+        val results = coroutineScope {
+            urls.map { url ->
+                async(Dispatchers.IO) { url to probeSize(url) }
+            }.awaitAll()
         }
-        return headFallback?.let { Probe(it, false) }
+
+        // 优先：确认支持分段的（chunked == true 且体积已知），取原顺序里最靠前的
+        results.firstOrNull { (_, probe) -> probe != null && probe.chunked && probe.total > 0 }
+            ?.let { return it.second }
+
+        // 兜底：有体积但没确认分段（HEAD 探到的）
+        return results.firstNotNullOfOrNull { (_, probe) -> probe?.takeIf { it.total > 0 } }
     }
 
     private suspend fun probeSize(url: String): Probe? {
+        // 探测用的是全局共享的短超时客户端（probeClient），必须排除在
+        // clients/allClients 的登记之外 —— 否则并发探测时，
+        // 先跑完的那条会把共享客户端从登记表里移除，
+        // 后跑完的再移除一次，甚至在 cancel()/收尾时把别人的连接掐掉。
         val client = probeClient
-        synchronized(clients) { clients.add(client) }
-        allClients.add(client)
 
         try {
             val rangeRequest = Request.Builder()
@@ -813,9 +921,6 @@ class DownloadEngine {
             throw e
         } catch (_: Exception) {
             return null
-        } finally {
-            synchronized(clients) { clients.remove(client) }
-            allClients.remove(client)
         }
     }
 
@@ -829,39 +934,37 @@ class DownloadEngine {
         const val MAX_ATTEMPTS = 3
         const val PROGRESS_INTERVAL_MS = 250L
 
-        /** 引擎并发上限（与 AccelerationSettings.MAX_CONNECTIONS 一致） */
-        const val MAX_LANES = 128
-
-        /** 单连接模式判断「能否升级为分段」时试探的字节数 */
+        /**
+         * 单连接模式判断「能否升级为分段」时试探的字节数
+         */
         const val SINGLE_PROBE_BYTES = 64 * 1024
 
         /**
-         * 渐进建连：每档放开多少条并发。
-         *
-         * 爬坡的目的是避开「起步瞬间几百个请求同时砸过去 → 503 ServerBusy」，
-         * 但步子太小会白白浪费前几秒带宽。16 是 64 并发下的平衡点：
-         * 单通道下 4 档（约 0.45s）就能顶满，既不会一开始就被限流，
-         * 也不至于让用户觉得「怎么慢慢悠悠的」。
-         *
-         * 极限档（128/256/512）如果仍按 16/档，爬满要 4.8s，起步太肉 ——
-         * 所以按 lanes/8 取步长：512 → 64/档 → 8 档 ≈ 1.2s；64 及以下仍是 16/档。
+         * 卡住看门狗窗口（毫秒）：有连接在飞、但超过这段时间一个字节都没落盘，
+         * 就判定卡住并强制重建所有在飞请求。CDN 的心跳字节会让 OkHttp 的
+         * readTimeout 永不触发，所以必须用「有没有真的写进文件」来判。
          */
-        fun rampStepFor(lanes: Int): Int = maxOf(RAMP_STEP, lanes / 8)
+        const val STALL_WINDOW_MS = 12_000L
 
-        const val RAMP_STEP = 16
+        /** 引擎并发上限（与 AccelerationSettings.MAX_CONNECTIONS 一致）。
+         *  注意这只是**上限**：真正的在飞并发由 [AdaptiveConcurrency] 的 AIMD 窗口决定，
+         *  服务器撑不住时引擎会自己降下来，不会再出现「128 条连接一起撞限流」。 */
+        const val MAX_LANES = 128
 
-        /** 渐进建连：每隔多少毫秒放开一档（配合 RAMP_STEP 决定爬坡总时长） */
-        const val CONNECTION_RAMP_INTERVAL_MS = 150L
+        /** 渐进建连的策略已由 [AdaptiveConcurrency]（AIMD 窗口）接管：
+         *  起始窗口 16，顺畅时加性增、限流时乘性减，不再需要时间片式的固定爬坡。 */
 
         /** 小于这个体积不做分段：切来切去不如一条连接拉完 */
         const val MIN_CHUNKED_TOTAL = 4L * 1024 * 1024
 
-        /** 探测专用客户端：限制总时长，防止某个通道不认 Range 时把整个文件都拉进内存 */
+        /** 探测专用客户端：限制总时长，防止某个通道不认 Range 时把整个文件都拉进内存。
+         *  超时从 15s 收紧到 8s：探测只该花一个 RTT，超过就说明这条通道不行，
+         *  让别的通道先出结果，而不是把整段下载卡在这一条上。 */
         val probeClient: OkHttpClient by lazy {
             OkHttpClient.Builder()
-                .connectTimeout(15, TimeUnit.SECONDS)
-                .readTimeout(15, TimeUnit.SECONDS)
-                .callTimeout(20, TimeUnit.SECONDS)
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(8, TimeUnit.SECONDS)
+                .callTimeout(12, TimeUnit.SECONDS)
                 .followRedirects(true)
                 .build()
         }
@@ -974,6 +1077,8 @@ private suspend fun runSlice(
     accumulator: ProgressAccumulator,
     inflight: CallRegistry,
     board: LaneBoard,
+    watchdog: StallWatchdog,
+    limiter: AdaptiveConcurrency,
 ) {
     var current = initial
 
@@ -1030,6 +1135,7 @@ private suspend fun runSlice(
                 laneId = laneId,
                 channel = channel,
                 channels = channels,
+                limiter = limiter,
             )
             outcome = result.first
             winner = result.second
@@ -1056,8 +1162,15 @@ private suspend fun runSlice(
                     lastStatus = (e as? DownloadException.Throttled)?.code,
                 ),
             )
-            // 失败的那一段必须还回池子，否则文件会缺一块
-            if (current.length > 0) pool.putBack(Chunk(0, from, current.end))
+            // 失败的那一段必须还回池子，否则文件会缺一块。
+            //
+            // 关键：带退避还回，而不是插到队首让它立刻被重取 ——
+            // 老实现就是那样把自己憋成「限流时疯狂撞墙、下载卡死」的。
+            // 限流退避更久，并且顺手把 AIMD 窗口砍一刀。
+            val isThrottled = e is DownloadException.Throttled
+            val backoffMs = if (isThrottled) 1_200L else 400L
+            if (current.length > 0) pool.putBack(Chunk(0, from, current.end), backoffMs)
+            if (isThrottled) limiter.noteThrottle() else limiter.noteFailure()
             // 让位退出，而不是向上抛：一条 lane 重试失败不该取消整个下载
             // —— 异常从协程冒出去会连带取消全部 worker。调度器马上会派新的
             // worker 继续吃池子里的区间；失败预算耗尽或 90s 无进展时再判死。
@@ -1069,10 +1182,13 @@ private suspend fun runSlice(
             writeAt(output, from, outcome.data, outcome.received)
             written.addAndGet(outcome.received.toLong())
             pool.recordDone(outcome.received.toLong())
+            watchdog.noteProgress(outcome.received.toLong())
             accumulator.advance(outcome.received.toLong())
             winner.observe(outcome.elapsedNanos, outcome.received.toLong())
             board.doneSlices.incrementAndGet()
             board.reward(winner.name)
+            // 顺畅通关：AIMD 加性增，窗口慢慢往上爬
+            limiter.noteSuccess()
 
             val seconds = maxOf(outcome.elapsedNanos / 1_000_000_000.0, 0.001)
             board.update(
@@ -1091,9 +1207,10 @@ private suspend fun runSlice(
             )
         }
         if (outcome.received < want) {
-            // 没取满（连接中途断了）：把缺的那一段还回池子重取，绝不丢数据
+            // 没取满（连接中途断了）：把缺的那一段还回池子重取，绝不丢数据。
+            // 带一点短退避，避免同一条坏连接立刻又把缺片捞回去。
             val missing = Chunk(0, from + outcome.received, to)
-            if (missing.length > 0) pool.putBack(missing)
+            if (missing.length > 0) pool.putBack(missing, 250L)
         }
 
         // 这一小片已经干完，回池子重新要活儿。
@@ -1138,6 +1255,7 @@ private suspend fun fetchSlice(
     laneId: Int,
     channel: RouteChannel,
     channels: List<RouteChannel>,
+    limiter: AdaptiveConcurrency? = null,
 ): Triple<SliceOutcome, RouteChannel, String> {
     var lastError: Exception = DownloadException.BadResponse
     var attempt = 0
@@ -1145,6 +1263,8 @@ private suspend fun fetchSlice(
     // 限流撞了两回就直接放弃这一片：继续退避 = 攥着区间干等，
     // 整条下载都陪着这条被限流的通道停摆。让位给调度器重新派。
     var throttledCount = 0
+    // 这一片已经试过的通道名：重试时优先换没试过的，避免在同一根坏线上反复撞
+    val tried = mutableSetOf(channel.name)
 
     while (attempt < DownloadEngine.MAX_ATTEMPTS) {
         // 每轮重试前先看有没有被取消
@@ -1163,15 +1283,19 @@ private suspend fun fetchSlice(
                 url = direct.primary
             } else {
                 // plan 里没有直连：用该通道自带的兜底（即直连 URL）
-                active = channels[pickRetryChannel(channels, channel.name)]
+                active = channels[pickRetryChannel(channels, tried)]
                 url = active.fallback
             }
         } else {
-            active = channels[pickRetryChannel(channels, channel.name)]
+            active = channels[pickRetryChannel(channels, tried)]
             url = active.primary
         }
+        tried.add(active.name)
         // 兜底地址即直连：成功不清除镜像的限流标记，归因清晰。
         val isFallbackUrl = url != active.primary
+        // 每次真正发出 HTTP 请求都占一个速率闸名额（重试也算），
+        // 否则遇到 429 疯狂重试时速率闸形同虚设。
+        limiter?.noteDispatch()
         val request = Request.Builder()
             .url(url)
             .header("Range", "bytes=${chunk.start}-${chunk.end}")
@@ -1319,16 +1443,18 @@ private fun pickChannel(channels: List<RouteChannel>, hint: Int): Int {
 }
 
 /**
- * 重试选路：加权随机，但排除刚失败的那条线。
- * 排除是为了“首失败即换线”：一直加权随机仍可能连抽同一条坏线，
+ * 重试选路：加权随机，但排除已经试过的那些线。
+ * 排除是为了「首失败即换线」：一直加权随机仍可能连抽同一条坏线，
  * 白白浪费 `MAX_ATTEMPTS` 里宝贵的第二次机会。
+ *
+ * @param excluding 本片已经试过的通道名（全试过则退回普通加权）。
  */
-private fun pickRetryChannel(channels: List<RouteChannel>, excluding: String): Int {
+private fun pickRetryChannel(channels: List<RouteChannel>, excluding: Set<String>): Int {
     if (channels.size == 1) return 0
     var total = 0.0
     val weights = DoubleArray(channels.size)
     for ((i, ch) in channels.withIndex()) {
-        if (ch.name == excluding) {
+        if (ch.name in excluding) {
             weights[i] = 0.0
             continue
         }
@@ -1337,7 +1463,7 @@ private fun pickRetryChannel(channels: List<RouteChannel>, excluding: String): I
         weights[i] = w
         total += w
     }
-    // 被排除后无可用（同名通道占满）：退回普通加权
+    // 被排除后无可用（全试过了）：退回普通加权，至少还能兜底
     if (total <= 0) return pickChannel(channels, (Math.random() * channels.size).toInt())
     var r = Math.random() * total
     for (i in weights.indices) {
@@ -1346,6 +1472,10 @@ private fun pickRetryChannel(channels: List<RouteChannel>, excluding: String): I
     }
     return weights.indices.maxByOrNull { weights[it] } ?: 0
 }
+
+/** 重试选路（排除单条通道，内部转调集合版本） */
+private fun pickRetryChannel(channels: List<RouteChannel>, excluding: String): Int =
+    pickRetryChannel(channels, setOf(excluding))
 
 /** 单片耗尽重试（已跨通道）后不立刻掀桌，攒够这么多才判死（与 iOS 同步）。 */
 internal fun maxSliceFailures(lanes: Int): Int = maxOf(20, lanes * 2)
@@ -1364,15 +1494,24 @@ internal object DownloadEngineFlag {
 }
 
 /**
- * 待下载区间的池子（滑动窗口）。
+ * 待下载区间的池子（滑动窗口 + 失败退避）。
  *
  * 关键设计：区间只记 (start, end)，不带全局编号 ——
  * 于是「把一段砍成两半」不需要给任何 worker 重新编号，
  * 写盘也能按偏移随意定位。这正是「随时切分、随时抢活」的前提。
+ *
+ * 关键修复：老实现里失败的片直接 `addFirst` 插回队首，下一个空闲 worker
+ * 立刻又把它捞走重试 —— 服务器正在限流时，这就成了一个「疯狂撞墙」的热循环：
+ * 连接数不掉、吞吐为零、用户看到的正是「卡住」。现在失败区间带 `notBefore`
+ * 退避时间，在到点之前对 [take] / [splitTail] 都不可见，
+ * 调度器自然会去干别的活儿。
  */
 internal class SlicePool(val total: Long, slices: Int = 1) {
 
-    private val queue = ConcurrentLinkedDeque<Chunk>()
+    /** 池内条目：区间 + 可被取走的时间（退避用，0 表示立刻可取） */
+    private data class Entry(val chunk: Chunk, val notBefore: Long = 0L)
+
+    private val queue = java.util.concurrent.ConcurrentLinkedDeque<Entry>()
 
     /** 每次「把末尾区间砍一刀」记一笔 */
     val splits = AtomicInteger(0)
@@ -1398,34 +1537,64 @@ internal class SlicePool(val total: Long, slices: Int = 1) {
         // 默认 slices=1 保持旧单测兼容。
         val target = maxOf(1, slices)
         if (target <= 1 || total <= 0) {
-            queue.add(Chunk(0, 0L, total - 1))
+            queue.add(Entry(Chunk(0, 0L, total - 1)))
         } else {
             val maxSlices = maxOf(1, (total / (64 * 1024)).toInt())
             val count = maxOf(1, minOf(target, maxSlices))
             if (count <= 1) {
-                queue.add(Chunk(0, 0L, total - 1))
+                queue.add(Entry(Chunk(0, 0L, total - 1)))
             } else {
                 val base = total / count
                 var start = 0L
                 for (i in 0 until count) {
                     val end = if (i == count - 1) total - 1 else start + base - 1
-                    queue.add(Chunk(0, start, end))
+                    queue.add(Entry(Chunk(0, start, end)))
                     start = end + 1
                 }
             }
         }
     }
 
-    /** 取一段活儿；没有就返回 null，由调度循环决定要不要切分 */
+    /**
+     * 取一段活儿；没有（或都在退避中）就返回 null，由调度循环决定要不要切分。
+     *
+     * 会跳过还在退避期的区间 —— 这是修「失败片立刻被重取」热循环的关键。
+     *
+     * 实现说明：`ConcurrentLinkedDeque` 的迭代器**不支持 remove()**（会抛
+     * UnsupportedOperationException），所以这里用「pollFirst 出来检查，
+     * 不合适就 addLast 放回去」的方式扫描一遍。扫描上限为当前队列长度快照，
+     * 保证不会因为边扫边放而变成死循环。
+     */
     fun take(): Chunk? {
-        val chunk = queue.pollFirst()
-        checkInvariants()
-        return chunk
+        val now = System.currentTimeMillis()
+        // 快照当前长度：这一轮最多检查这么多条，放回去的条目留给下一轮
+        var remaining = queue.size
+        while (remaining-- > 0) {
+            val entry = queue.pollFirst() ?: return null
+            if (entry.notBefore <= now) {
+                checkInvariants()
+                return entry.chunk
+            }
+            queue.addLast(entry)
+        }
+        return null
     }
 
-    /** 把没下完的区间还回队列最前面 */
-    fun putBack(chunk: Chunk) {
-        queue.addFirst(chunk)
+    /** 退避中的区间还剩几个（调度器据此决定等多久） */
+    fun deferredCount(): Int {
+        val now = System.currentTimeMillis()
+        return queue.count { it.notBefore > now }
+    }
+
+    /**
+     * 把没下完的区间还回队列最前面。
+     *
+     * @param backoffMs 多久之后才允许再被取走。失败重派时必须给非零值，
+     *  否则就是老实现那个「立刻重取、疯狂撞墙」的热循环。
+     */
+    fun putBack(chunk: Chunk, backoffMs: Long = 0L) {
+        val notBefore = if (backoffMs > 0) System.currentTimeMillis() + backoffMs else 0L
+        queue.addFirst(Entry(chunk, notBefore))
         checkInvariants()
     }
 
@@ -1441,7 +1610,7 @@ internal class SlicePool(val total: Long, slices: Int = 1) {
      */
     private fun checkInvariants() {
         if (!ENABLE_INVARIANTS) return
-        val snapshot = queue.toList().sortedBy { it.start }
+        val snapshot = queue.map { it.chunk }.sortedBy { it.start }
         var prevEnd = -1L
         for (chunk in snapshot) {
             check(chunk.start in 0 until total) {
@@ -1464,23 +1633,38 @@ internal class SlicePool(val total: Long, slices: Int = 1) {
      * 池子空了、但还有连接闲着时调用：
      * 从队列末尾挑一段最大的砍成两半 ——
      * 右半段留在池子里，左半段直接返回给这个空闲连接。
+     *
+     * 只砍「立刻可取」的区间；正在退避的区间不动它们，
+     * 免得把一块还没到期的坏区间砍碎后到处散落。
+     *
+     * 实现：先 pollLast 出来；若是退避中的条目就放回末尾、继续往前找，
+     * 找到合适的就切一半、把右半段 addLast 回队尾。
+     * 全程只用 deque 的原子操作，不做「整队列重建」——
+     * 后者会丢掉其他 worker 在同一瞬间 putBack 进来的区间。
      */
     fun splitTail(live: Int, target: Int): Chunk? {
         if (live <= 0) return null
 
-        val victim = queue.pollLast() ?: return null
-        if (victim.length <= target.toLong()) {
-            // 已经切到目标粒度了，别再无谓地碎片化
-            queue.addLast(victim)
-            checkInvariants()
-            return null
-        }
+        val now = System.currentTimeMillis()
+        // 最多检查「当前长度」条，避免在边取边放时无限循环
+        var budget = queue.size
+        while (budget-- > 0) {
+            val entry = queue.pollLast() ?: return null
+            val victim = entry.chunk
 
-        val half = victim.length / 2
-        queue.addLast(Chunk(0, victim.start + half, victim.end))
-        splits.incrementAndGet()
-        checkInvariants()
-        return Chunk(0, victim.start, victim.start + half - 1)
+            if (entry.notBefore > now || victim.length <= target.toLong()) {
+                // 退避中的、或已经切到目标粒度的：放回末尾，继续往前找
+                queue.addLast(entry)
+                continue
+            }
+
+            val half = victim.length / 2
+            queue.addLast(Entry(Chunk(0, victim.start + half, victim.end), 0L))
+            splits.incrementAndGet()
+            checkInvariants()
+            return Chunk(0, victim.start, victim.start + half - 1)
+        }
+        return null
     }
 }
 

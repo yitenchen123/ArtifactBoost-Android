@@ -1,5 +1,7 @@
 package com.artifactboost.app.ui.screens
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,16 +16,16 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
@@ -31,6 +33,8 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
@@ -42,6 +46,9 @@ import androidx.compose.ui.unit.sp
 import com.artifactboost.app.download.DownloadDiagnostics
 import com.artifactboost.app.download.LaneSnapshot
 import com.artifactboost.app.download.SegmentState
+import com.artifactboost.app.ui.components.GradientProgressBar
+import com.artifactboost.app.ui.components.LaneHeatStrip
+import com.artifactboost.app.ui.components.MetricTile
 import com.artifactboost.app.ui.theme.AppTheme
 import com.artifactboost.app.util.formatBytes
 import com.artifactboost.app.util.formatSpeed
@@ -157,55 +164,108 @@ private fun SummaryHeader(diagnostics: DownloadDiagnostics) {
     val totalSpeed = diagnostics.lanes.sumOf { it.speedBytesPerSecond }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            StatTile(
-                label = "实时总速度",
-                value = formatSpeed(totalSpeed),
-                tint = colors.green,
-                modifier = Modifier.weight(1f),
-            )
-            StatTile(
-                label = "活跃 / 目标连接",
+        // 大数字：实时总速度（这是用户最关心的一个数）
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(MaterialTheme.shapes.medium)
+                .background(colors.green.copy(alpha = 0.08f))
+                .border(1.dp, colors.green.copy(alpha = 0.25f), MaterialTheme.shapes.medium)
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text("实时总速度", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = colors.subtle)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Icon(Icons.Filled.Bolt, contentDescription = null, tint = colors.green, modifier = Modifier.size(15.dp))
+                Text(
+                    formatSpeed(totalSpeed),
+                    fontSize = 26.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace,
+                    color = colors.green,
+                )
+            }
+        }
+
+        // 分段热力条：颜色 = 状态
+        if (diagnostics.lanes.isNotEmpty()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(MaterialTheme.shapes.medium)
+                    .background(colors.surface)
+                    .border(1.dp, colors.border, MaterialTheme.shapes.medium)
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                LaneHeatStrip(diagnostics.lanes)
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            MetricTile(
+                label = "活跃 / 目标",
                 value = "${diagnostics.lanes.size} / ${diagnostics.targetLanes}",
+                modifier = Modifier.weight(1f),
                 tint = colors.blue,
-                modifier = Modifier.weight(1f),
             )
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            StatTile(
-                label = "切片 完成 / 累计",
-                value = "${diagnostics.doneSlices} / ${diagnostics.totalSlices}",
+            MetricTile(
+                label = "自适应窗口",
+                value = if (diagnostics.adaptiveWindow > 0) "${diagnostics.adaptiveWindow}" else "—",
+                modifier = Modifier.weight(1f),
                 tint = colors.purple,
-                modifier = Modifier.weight(1f),
-            )
-            StatTile(
-                label = "重试 / 限流 / 切分",
-                value = "${diagnostics.retries} / ${diagnostics.throttles} / ${diagnostics.splits}",
-                tint = if (diagnostics.throttles > 0) colors.orange else colors.muted,
-                modifier = Modifier.weight(1f),
             )
         }
-        if (diagnostics.throttles > 0) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            MetricTile(
+                label = "切片 完成/累计",
+                value = "${diagnostics.doneSlices} / ${diagnostics.totalSlices}",
+                modifier = Modifier.weight(1f),
+                tint = colors.muted,
+            )
+            MetricTile(
+                label = "重试 / 切分",
+                value = "${diagnostics.retries} / ${diagnostics.splits}",
+                modifier = Modifier.weight(1f),
+                tint = colors.orange,
+            )
+        }
+
+        if (diagnostics.windowIncreases > 0 || diagnostics.windowDecreases > 0) {
+            MetricTile(
+                label = "窗口 涨/缩 · 峰值",
+                value = "${diagnostics.windowIncreases} / ${diagnostics.windowDecreases} · ${diagnostics.windowPeak}",
+                modifier = Modifier.fillMaxWidth(),
+                tint = colors.blue,
+            )
+        }
+
+        if (diagnostics.stalled) {
             Text(
-                "检测到服务端限流（429/503）：引擎已按指数退避自动降速重试，"
-                    + "并对该通道临时降低并发。这属于正常的自我节流，不是下载失败。",
+                "检测到连接卡住：引擎已自动掐断并重建连接，速度会很快恢复。",
                 fontSize = 11.sp,
                 color = colors.orange,
             )
         }
-    }
-}
 
-@Composable
-private fun StatTile(label: String, value: String, tint: Color, modifier: Modifier = Modifier) {
-    val colors = AppTheme.colors
-    Column(
-        modifier = modifier
-            .padding(vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        Text(label, fontSize = 10.sp, color = colors.muted)
-        Text(value, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = tint)
+        if (diagnostics.throttles > 0) {
+            Text(
+                "检测到服务端限流（429/503）：引擎已自动砍半并发并按指数退避重试，"
+                    + "这是正常的自我节流，不是下载失败。",
+                fontSize = 11.sp,
+                color = colors.orange,
+            )
+        }
+
+        Text(
+            "说明：并发上限在「设置」里调整。引擎用 AIMD 自适应算法自己爬到服务器愿意给的并发 —— "
+                + "「自适应窗口」就是当前实际在用的档位，遇到限流会自动砍半。",
+            fontSize = 10.sp,
+            color = colors.subtle,
+        )
     }
 }
 
@@ -253,24 +313,29 @@ private fun RouteSection(diagnostics: DownloadDiagnostics) {
 private fun LaneCard(lane: LaneSnapshot) {
     val colors = AppTheme.colors
     val tint = stateColor(lane.state)
+    val brush = Brush.horizontalGradient(listOf(tint.copy(alpha = 0.6f), tint))
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 4.dp),
+            .clip(MaterialTheme.shapes.small)
+            .background(colors.canvas.copy(alpha = 0.5f))
+            .border(1.dp, colors.border.copy(alpha = 0.5f), MaterialTheme.shapes.small)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 "#${lane.laneId}",
-                fontSize = 12.sp,
+                fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
                 color = colors.strongText,
             )
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(7.dp))
             Text(
                 lane.routeName,
-                fontSize = 11.sp,
+                fontSize = 10.sp,
                 color = colors.muted,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -278,43 +343,45 @@ private fun LaneCard(lane: LaneSnapshot) {
             )
             Text(
                 lane.state.label,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                color = tint,
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .background(tint.copy(alpha = 0.12f))
+                    .padding(horizontal = 5.dp, vertical = 1.5.dp),
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                formatSpeed(lane.speedBytesPerSecond),
                 fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
                 color = tint,
             )
         }
 
-        LinearProgressIndicator(
-            progress = { lane.fraction },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(4.dp),
-            color = tint,
-            trackColor = colors.border,
-        )
+        GradientProgressBar(fraction = lane.fraction, height = 4.dp, tint = brush)
 
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 "${formatBytes(lane.start)} – ${formatBytes(lane.end)}",
-                fontSize = 10.sp,
+                fontSize = 9.sp,
                 color = colors.subtle,
                 fontFamily = FontFamily.Monospace,
             )
             Spacer(Modifier.weight(1f))
             if (lane.attempt > 1) {
-                Text("第 ${lane.attempt} 次", fontSize = 10.sp, color = colors.orange)
+                Text("第 ${lane.attempt} 次", fontSize = 9.sp, color = colors.orange)
                 Spacer(Modifier.width(8.dp))
             }
             if (lane.lastStatus != null) {
-                Text("HTTP ${lane.lastStatus}", fontSize = 10.sp, color = colors.muted)
-                Spacer(Modifier.width(8.dp))
+                Text(
+                    "HTTP ${lane.lastStatus}",
+                    fontSize = 9.sp,
+                    color = if (lane.lastStatus >= 400) colors.orange else colors.subtle,
+                )
             }
-            Text(
-                formatSpeed(lane.speedBytesPerSecond),
-                fontSize = 10.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = colors.strongText,
-            )
         }
     }
 }

@@ -92,6 +92,10 @@ fun SettingsScreen() {
     }
 
     fun persist(updated: AccelerationSettings) {
+        // 换下载源时清掉通道探测缓存：旧的排序对新源不再适用
+        if (updated.mode != settings.mode || updated.customPrefix != settings.customPrefix) {
+            com.artifactboost.app.download.RouteProbeCache.invalidateAll()
+        }
         settings = updated
         updated.save(context)
     }
@@ -197,7 +201,25 @@ fun SettingsScreen() {
                     CardSurface {
                         Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text("并发连接数", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = colors.strongText)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        "并发上限",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = colors.strongText,
+                                    )
+                                    Spacer(Modifier.weight(1f))
+                                    Text(
+                                        "${settings.clampedConnections}",
+                                        fontSize = 17.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                        color = colors.blue,
+                                    )
+                                }
                                 SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                                     AccelerationSettings.CONNECTION_OPTIONS.forEachIndexed { index, count ->
                                         SegmentedButton(
@@ -210,12 +232,24 @@ fun SettingsScreen() {
                                         ) { Text("$count", fontSize = 13.sp) }
                                     }
                                 }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Text(
+                                        "✦ 自适应引擎会按服务器反馈自动增减并发，这里设的只是天花板",
+                                        fontSize = 10.sp,
+                                        color = colors.subtle,
+                                    )
+                                }
                             }
 
                             Hairline()
 
                             Text(
-                                "并发数越大越能跑满带宽；绿色网络环境建议 32~64，一般 16 即可，千兆内网/高速 Wi-Fi 可试 128。被限流时引擎会自动退让并把活儿转给健康通道，不会失败。设置会自动保存，下载时直接生效。",
+                                "这是**上限**而不是固定连接数。引擎用 AIMD 自适应算法：下载顺畅时慢慢往上爬（最多爬到上限），"
+                                    + "一遇限流（429/503）立刻砍半退让。所以设 128 不会像以前那样盲目砸 128 条连接撞限流 —— "
+                                    + "只会给引擎更高的天花板。一般 16~32 就够，自建中转可以拉到 64~128。设置会自动保存，下载时直接生效。",
                                 fontSize = 11.sp,
                                 color = colors.subtle,
                             )

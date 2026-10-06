@@ -1,21 +1,26 @@
 package com.artifactboost.app.ui.screens
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.SwipeLeft
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -34,6 +39,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -42,7 +48,9 @@ import com.artifactboost.app.ArtifactBoostApp
 import com.artifactboost.app.data.DownloadItem
 import com.artifactboost.app.ui.components.CardSurface
 import com.artifactboost.app.ui.components.EmptyStateView
+import com.artifactboost.app.ui.components.MetricTile
 import com.artifactboost.app.ui.theme.AppTheme
+import com.artifactboost.app.util.formatSpeed
 
 /**
  * 下载中心：所有正在下载 / 已完成的任务。
@@ -107,12 +115,32 @@ fun DownloadsScreen() {
                     )
                 }
             } else {
+                // 实时总览卡片：用户在下载页一眼就能看到当前整机吞吐
                 item {
-                    Text(
-                        if (activeCount > 0) "正在下载 $activeCount 个" else "全部下载",
-                        fontSize = 12.sp,
-                        color = colors.muted,
-                    )
+                    OverviewCard(states = states, items = items)
+                }
+
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            if (activeCount > 0) "正在下载 $activeCount 个" else "全部下载",
+                            fontSize = 12.sp,
+                            color = colors.muted,
+                        )
+                        Spacer(Modifier.weight(1f))
+                        if (activeCount > 0) {
+                            Text(
+                                formatSpeed(totalSpeed(states)),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                color = colors.green,
+                            )
+                        }
+                    }
                 }
 
                 items(items, key = { it.id }) { item ->
@@ -165,5 +193,100 @@ fun DownloadsScreen() {
                 TextButton(onClick = { pendingRemove = null }) { Text("取消") }
             },
         )
+    }
+}
+
+/** 所有在下载任务的速度之和 */
+private fun totalSpeed(states: Map<String, com.artifactboost.app.download.DownloadState>): Double =
+    states.values.sumOf {
+        if (it is com.artifactboost.app.download.DownloadState.Downloading) {
+            it.progress.speedBytesPerSecond
+        } else {
+            0.0
+        }
+    }
+
+/**
+ * 实时总览卡片：大号总速度 + 进行中/已完成/失败三块指标。
+ */
+@Composable
+private fun OverviewCard(
+    states: Map<String, com.artifactboost.app.download.DownloadState>,
+    items: List<DownloadItem>,
+) {
+    val colors = AppTheme.colors
+    val active = items.count {
+        states[it.id] is com.artifactboost.app.download.DownloadState.Downloading ||
+            states[it.id] is com.artifactboost.app.download.DownloadState.Resolving
+    }
+    val finished = items.count { states[it.id] is com.artifactboost.app.download.DownloadState.Finished }
+    val failed = items.count { states[it.id] is com.artifactboost.app.download.DownloadState.Failed }
+    val speed = totalSpeed(states)
+
+    CardSurface(padding = 14.dp) {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(30.dp)
+                        .clip(CircleShape)
+                        .background(colors.green.copy(alpha = 0.15f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        if (active > 0) Icons.Filled.Bolt else Icons.Filled.CheckCircle,
+                        contentDescription = null,
+                        tint = colors.green,
+                        modifier = Modifier.size(15.dp),
+                    )
+                }
+                Column {
+                    Text(
+                        if (active > 0) "正在加速" else "空闲",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = colors.strongText,
+                    )
+                    Text("自适应并发 · 多通道叠加", fontSize = 10.sp, color = colors.subtle)
+                }
+                Spacer(Modifier.weight(1f))
+                if (active > 0) {
+                    Text(
+                        formatSpeed(speed),
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                        color = colors.green,
+                    )
+                }
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                MetricTile(
+                    label = "进行中",
+                    value = "$active",
+                    modifier = Modifier.weight(1f),
+                    tint = colors.blue,
+                    icon = Icons.Filled.ArrowDownward,
+                )
+                MetricTile(
+                    label = "已完成",
+                    value = "$finished",
+                    modifier = Modifier.weight(1f),
+                    tint = colors.green,
+                    icon = Icons.Filled.CheckCircle,
+                )
+                MetricTile(
+                    label = "失败",
+                    value = "$failed",
+                    modifier = Modifier.weight(1f),
+                    tint = if (failed > 0) colors.red else colors.subtle,
+                    icon = Icons.Filled.Warning,
+                )
+            }
+        }
     }
 }

@@ -234,10 +234,46 @@ class DownloadManager(
         // 所以「这条通道该套哪个 URL」必须逐条算，不能统一用 signedUrl。
         val githubUrl = item.source.ghfastEligibleUrl
 
-        // 无测速：候选通道直接全部并行，初始权重均等，
-        // 引擎下载中按实时吞吐动态调整分配。
         val candidates = settings.candidateRoutes(item.isPrivate, githubUrl)
-        val plan: List<ScoredRoute> = candidates.map { ScoredRoute(it, 1.0) }
+        val basePlan: List<ScoredRoute> = candidates.map { ScoredRoute(it, 1.0) }
+        var routeUrls = resolveRouteUrls(basePlan, signedUrl, githubUrl)
+
+        // 通道探测（已探过的 5 分钟内直接复用）：
+        // 老实现是「按设置里的固定顺序串行先用第一条」，4 个镜像里前 3 个是死的
+        // 就得干等三次超时 —— 用户体感就是「下不动 / 半天才开始」。
+        // 现在同时探测所有候选，可用的先上岗，死的立刻剔除，并把实测速度
+        // 作为初始权重喂给引擎（不再是从均等的 1 开始瞎试）。
+        val plan: List<ScoredRoute>
+        if (candidates.size > 1) {
+            val host = runCatching { java.net.URI(signedUrl).host }.getOrNull()
+            val cached = host?.let { RouteProbeCache.cached(it) }
+            if (cached != null) {
+                // 缓存里可能混有「这次不适用」的通道（比如 ghfast 只对发行版有效），
+                // 按本次候选过滤一遍再用，避免把无关通道塞回计划。
+                val names = candidates.map { it.name }.toSet()
+                val filtered = cached.filter { it.route.name in names }
+                plan = planFromProbes(filtered, candidates)
+            } else {
+                setRouteSummary(item.id, "正在探测最快通道…")
+                val probes = RouteProbeCache.probe(candidates, routeUrls.map { it.second })
+                if (host != null) RouteProbeCache.store(probes, host)
+                plan = planFromProbes(probes, candidates)
+            }
+            // 探测后按新的顺序重排 URL，保证 plan 与 routeUrls 一一对应
+            routeUrls = plan.map { scored ->
+                when (scored.route.scope) {
+                    RouteScope.ANY -> scored.route to scored.route.apply(signedUrl)
+                    RouteScope.GITHUB_ONLY -> {
+                        val base = githubUrl ?: signedUrl
+                        scored.route to scored.route.apply(base)
+                    }
+                }
+            }
+            _routeSummary.value = _routeSummary.value - item.id
+        } else {
+            plan = basePlan
+        }
+
         val note: String = if (item.isPrivate && settings.mode == RouteMode.SMART) {
             "直连（私有仓库不走镜像）"
         } else {
@@ -249,9 +285,6 @@ class DownloadManager(
         // 源码包由 GitHub 现场打包，通常不支持 Range；但引擎会自己探测，
         // 真拿到 206 就自动升级成多线程，所以这里只是「别抱太大期望」的提示
         val mayChunk = item.source.supportsChunkedDownload
-
-        // 逐条通道算出它该用的 URL：ghfast 用 github.com 地址，其余用签名地址
-        val routeUrls = resolveRouteUrls(plan, signedUrl, githubUrl)
 
         return try {
             val result = engine.download(
@@ -269,6 +302,8 @@ class DownloadManager(
         } catch (e: Exception) {
             // 通道可能失效/被限流，整体回退直连再试一次
             if (!shouldRetry(e) || plan.none { !it.route.isDirect }) throw e
+            // 顺带把探测缓存清掉：这次全军覆没说明排序已经不适用了
+            RouteProbeCache.invalidateAll()
             val result = engine.download(
                 routeUrls = listOf(DownloadRoute.DIRECT to signedUrl),
                 routes = listOf(ScoredRoute(DownloadRoute.DIRECT, 1.0)),
@@ -282,6 +317,29 @@ class DownloadManager(
             setRouteSummary(item.id, "直连（$note 失败已回退） · 平均 ${formatSpeed(result.averageSpeed)}")
             result.file
         }
+    }
+
+    /**
+     * 把探测结果映射成「带初始权重的通道计划」。
+     *
+     * 规则：
+     *  - 探测可用的通道按实测速度给权重（引擎一开始就把活儿压到真正的快线上）；
+     *  - 探测不可用的通道剔除，但**直连永远保留**（引擎的最终兜底依赖它，
+     *    而且探测失败也可能只是那一次握手抖动）；
+     *  - 全部不可用时保留原样，让引擎自己按老逻辑兜底。
+     */
+    private fun planFromProbes(
+        probes: List<RouteProbeResult>,
+        candidates: List<DownloadRoute>,
+    ): List<ScoredRoute> {
+        if (probes.isEmpty()) return candidates.map { ScoredRoute(it, 1.0) }
+        val usable = probes.filter { it.ok }.toMutableList()
+        // 直连必须留在计划里（兜底通道）
+        if (usable.none { it.route.isDirect }) {
+            probes.firstOrNull { it.route.isDirect }?.let { usable.add(it) }
+        }
+        val source = if (usable.isEmpty()) probes else usable
+        return source.map { ScoredRoute(it.route, maxOf(it.speed, 1.0)) }
     }
 
     /**

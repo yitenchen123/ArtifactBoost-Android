@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -19,6 +20,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -28,14 +31,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.artifactboost.app.download.LaneSnapshot
+import com.artifactboost.app.download.SegmentState
+import com.artifactboost.app.ui.theme.AppColors
 import com.artifactboost.app.ui.theme.AppTheme
 import com.artifactboost.app.ui.theme.languageColor
+import com.artifactboost.app.util.formatSpeed
 
 /** 圆角图标（GitHub 移动端的仓库 / 文件图标风格，圆角走 MD3 shape scale） */
 @Composable
@@ -280,5 +289,239 @@ fun SkeletonBlock(lines: Int = 4) {
                 Spacer(Modifier.width(0.dp))
             }
         }
+    }
+}
+
+// MARK: - 视觉升级组件（与 iOS 版 Theme.swift 一一对应）
+
+/** 品牌渐变（加速相关的强调元素统一用它） */
+fun brandGradient(colors: AppColors): Brush = Brush.linearGradient(
+    colors = listOf(colors.blue, colors.purple),
+)
+
+/** 速度渐变（速度越快颜色越「热」） */
+fun speedGradient(colors: AppColors): Brush = Brush.horizontalGradient(
+    colors = listOf(colors.green, colors.blue),
+)
+
+/**
+ * 渐变进度条：比系统 LinearProgressIndicator 更有速度感。
+ *
+ * [stalled] 为 true 时条会慢速呼吸，提示用户「不是界面死了，是连接卡住正在重建」。
+ */
+@Composable
+fun GradientProgressBar(
+    fraction: Float,
+    modifier: Modifier = Modifier,
+    height: androidx.compose.ui.unit.Dp = 8.dp,
+    tint: Brush? = null,
+    stalled: Boolean = false,
+) {
+    val colors = AppTheme.colors
+    val brush = tint ?: brandGradient(colors)
+    val transition = rememberInfiniteTransition(label = "stallBreathe")
+    val breatheAlpha by transition.animateFloat(
+        initialValue = 1f,
+        targetValue = 0.45f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(900),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "breatheAlpha",
+    )
+    val safeFraction = fraction.coerceIn(0f, 1f)
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(height)
+            .clip(CircleShape)
+            .background(colors.border.copy(alpha = 0.5f)),
+    ) {
+        // 用 fillMaxWidth(fraction) 而不是 Canvas：自带 RTL 正确行为，
+        // 且 fraction 变化时由布局层做动画，不需要额外的手动插值。
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(safeFraction)
+                .height(height)
+                .clip(CircleShape)
+                .background(brush)
+                .alpha(if (stalled) breatheAlpha else 1f),
+        )
+    }
+}
+
+/**
+ * 速度徽标：把「12.4 MB/s」做成一眼能读到重点的胶囊。
+ * 数字用等宽字体，速度刷新时宽度不跳。
+ */
+@Composable
+fun SpeedBadge(bytesPerSecond: Double, compact: Boolean = false) {
+    val colors = AppTheme.colors
+    Row(
+        modifier = Modifier
+            .clip(CircleShape)
+            .background(colors.green.copy(alpha = 0.12f))
+            .padding(horizontal = if (compact) 7.dp else 9.dp, vertical = if (compact) 3.dp else 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Icon(
+            Icons.Filled.Bolt,
+            contentDescription = null,
+            tint = colors.green,
+            modifier = Modifier.size(if (compact) 10.dp else 11.dp),
+        )
+        Text(
+            text = formatSpeed(bytesPerSecond),
+            fontSize = if (compact) 11.sp else 12.sp,
+            fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.Monospace,
+            color = colors.green,
+        )
+    }
+}
+
+/**
+ * 分段连接热力条：一眼看出上百条连接里哪几条在跑、哪几条卡住。
+ * 每条用 2dp 宽的小竖条表示，颜色按状态走 —— 比文字列表直观得多。
+ *
+ * 按 `lanes.size` 均分宽度：条数少时每条更宽（更容易看出状态），
+ * 条数上百时自动收窄成细线 —— 128 条连接也不会糊成一团。
+ */
+@Composable
+fun LaneHeatStrip(lanes: List<LaneSnapshot>, modifier: Modifier = Modifier) {
+    val colors = AppTheme.colors
+    if (lanes.isEmpty()) return
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(1.5.dp),
+    ) {
+        lanes.forEach { lane ->
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clip(CircleShape)
+                    .background(stateColorOf(lane.state, colors)),
+            )
+        }
+    }
+}
+
+/** 分段状态 → 语义色（热力条与明细行共用） */
+fun stateColorOf(state: SegmentState, colors: AppColors): Color = when (state) {
+    SegmentState.PENDING -> colors.border
+    SegmentState.DOWNLOADING -> colors.green
+    SegmentState.RETRYING -> colors.orange
+    SegmentState.DONE -> colors.blue.copy(alpha = 0.7f)
+    SegmentState.FAILED -> colors.red
+}
+
+/**
+ * 圆角统计瓦片：把数字做大，标签做小 —— 信息密度和可读性兼顾。
+ */
+@Composable
+fun MetricTile(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    tint: Color? = null,
+    icon: ImageVector? = null,
+) {
+    val colors = AppTheme.colors
+    Column(
+        modifier = modifier
+            .clip(MaterialTheme.shapes.small)
+            .background(colors.canvas.copy(alpha = 0.7f))
+            .border(1.dp, colors.border.copy(alpha = 0.7f), MaterialTheme.shapes.small)
+            .padding(horizontal = 11.dp, vertical = 9.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            if (icon != null) {
+                Icon(icon, contentDescription = null, tint = colors.subtle, modifier = Modifier.size(11.dp))
+            }
+            Text(label, fontSize = 10.sp, fontWeight = FontWeight.Medium, color = colors.subtle)
+        }
+        Text(
+            value,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.Monospace,
+            color = tint ?: colors.strongText,
+            maxLines = 1,
+        )
+    }
+}
+
+/**
+ * 圆角卡片（带渐变描边）—— 用于「正在下载」这种需要一眼抓住注意力的容器。
+ */
+@Composable
+fun GradientBorderCard(
+    modifier: Modifier = Modifier,
+    padding: androidx.compose.ui.unit.Dp = 14.dp,
+    active: Boolean = false,
+    content: @Composable () -> Unit,
+) {
+    val colors = AppTheme.colors
+    val brush = brandGradient(colors)
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(MaterialTheme.shapes.medium)
+            .background(colors.surface)
+            .then(
+                if (active) {
+                    Modifier.border(1.6.dp, brush, MaterialTheme.shapes.medium)
+                } else {
+                    Modifier.border(1.dp, colors.border, MaterialTheme.shapes.medium)
+                },
+            )
+            .padding(padding),
+    ) {
+        content()
+    }
+}
+
+/**
+ * 速度趋势迷你折线：把最近若干拍的速度画成一条细线。
+ * 「速度在涨还是在掉」用文字看不出来，用一条线一秒钟就懂了。
+ */
+@Composable
+fun SpeedSparkline(samples: List<Double>, modifier: Modifier = Modifier) {
+    val colors = AppTheme.colors
+    if (samples.size < 2) return
+    val maxValue = samples.maxOrNull()?.coerceAtLeast(1.0) ?: 1.0
+    val brush = speedGradient(colors)
+
+    androidx.compose.foundation.Canvas(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(18.dp),
+    ) {
+        val stepX = size.width / (samples.size - 1).coerceAtLeast(1)
+        val path = androidx.compose.ui.graphics.Path()
+        samples.forEachIndexed { index, value ->
+            val x = index * stepX
+            val y = size.height * (1f - (value / maxValue).toFloat()).coerceIn(0f, 1f)
+            if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        drawPath(
+            path = path,
+            brush = brush,
+            style = androidx.compose.ui.graphics.drawscope.Stroke(
+                width = 2.2f,
+                cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                join = androidx.compose.ui.graphics.StrokeJoin.Round,
+            ),
+        )
     }
 }
