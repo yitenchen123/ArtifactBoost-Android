@@ -402,7 +402,19 @@ class DownloadEngine {
             // 先探测体积 + 确认服务器是否真的支持 Range
             val probe = if (allowChunking) probeSize(urls) else null
             val total = probe?.total
-            val lanes = connections.coerceIn(1, MAX_LANES)
+
+            // **按可用堆内存限制并发**（大文件的关键修复）。
+            //
+            // 每个分片在 fetchSlice 里会 new 一个 ByteArray(分片大小)，
+            // 而分片大小上限是 MAX_SLICE_TARGET。以前直接按用户设的
+            // 128 并发跑 —— 128 × 4MB = 512MB 的瞬时峰值，
+            // Android 上必然 OOM / 疯狂 GC，表现就是「大文件完全下不动」。
+            //
+            // 现在先按「当前可用堆 / 单分片大小」算出安全并发，再和用户设的上限取小。
+            val lanes = MemoryBudget.safeLanes(
+                requested = connections.coerceIn(1, MAX_LANES),
+                bytesPerLane = MAX_SLICE_TARGET.toLong(),
+            )
 
             if (total == null || total <= 0) {
                 // 探测不到体积（不少接口不回 Content-Length）：
@@ -521,7 +533,13 @@ class DownloadEngine {
         // worker 留出替补线程，否则线程池被卡住的 job 占满时，新活儿根本派不下去
         //（那正是「卡住之后再也恢复不了」的成因）。
         // （声明在 try 外面：finally 里要 close 它。）
-        val enginePool = Executors.newFixedThreadPool(lanes + THREAD_POOL_HEADROOM)
+        //
+        // 线程数封顶：即便 lanes 被放到 128，也不必真的开 136 条线程 ——
+        // 每条线程都有栈内存开销（Android 上常见 1MB），136 条就是 136MB 虚拟内存。
+        // 这里封到 72（64 + 8 富余），配合 MemoryBudget 的内存约束，
+        // 大文件也不会把低端机拖垮。
+        val poolThreads = minOf(lanes + THREAD_POOL_HEADROOM, MAX_POOL_THREADS)
+        val enginePool = Executors.newFixedThreadPool(poolThreads)
             .asCoroutineDispatcher()
 
         try {
@@ -1122,6 +1140,16 @@ class DownloadEngine {
         const val THREAD_POOL_HEADROOM = 8
 
         /**
+         * 线程池的绝对上限。
+         *
+         * 线程本身也有成本（栈内存，Android 上常见 1MB）。lanes=128 时
+         * 开 136 条线程毫无必要 —— 实际吞吐瓶颈在带宽和源端，不在线程数。
+         * 封到 72 条（64 并发 + 8 富余）已经足够打满常见宽带，
+         * 同时把内存开销控制在可接受范围。
+         */
+        const val MAX_POOL_THREADS = 72
+
+        /**
          * 单片可接受的最低平均速度：低于它就不是「慢」、是「卡住」。
          * 用于推算单片的总时长上限（与 iOS 端一致）。
          */
@@ -1141,13 +1169,15 @@ class DownloadEngine {
             maxOf(20_000L, length * 1000L / MIN_ACCEPTABLE_SLICE_SPEED)
 
         /** 探测专用客户端：限制总时长，防止某个通道不认 Range 时把整个文件都拉进内存。
-         *  超时从 15s 收紧到 8s：探测只该花一个 RTT，超过就说明这条通道不行，
-         *  让别的通道先出结果，而不是把整段下载卡在这一条上。 */
+         *  超时从 8s 收到 3s：探测只是发一个 `Range: bytes=0-0`（拿体积），
+         *  正常情况一个 RTT 就回来了；8s 会让「所有通道都慢」时白白卡住很久 ——
+         *  大文件用户对这个特别敏感（「解析下载地址很慢」的体感来源之一）。
+         *  几条通道是并发打的，取最先回来的那条，3s 已经足够。 */
         val probeClient: OkHttpClient by lazy {
             OkHttpClient.Builder()
-                .connectTimeout(8, TimeUnit.SECONDS)
-                .readTimeout(8, TimeUnit.SECONDS)
-                .callTimeout(12, TimeUnit.SECONDS)
+                .connectTimeout(3, TimeUnit.SECONDS)
+                .readTimeout(3, TimeUnit.SECONDS)
+                .callTimeout(5, TimeUnit.SECONDS)
                 .followRedirects(true)
                 .build()
         }
@@ -1227,8 +1257,21 @@ class DownloadEngine {
  */
 internal const val MIN_SLICE_TARGET = 64 * 1024
 
-/** 一次分片请求的目标字节数上限：太大就退化成「一条连接啃大块」了 */
-internal const val MAX_SLICE_TARGET = 4 * 1024 * 1024
+/**
+ * 一次分片请求的目标字节数上限。
+ *
+ * 从 4MB 降到 1MB —— 这是**大文件能否正常下载**的关键。
+ *
+ * 每个 worker 在处理分片时要在内存里 `new ByteArray(分片大小)`，
+ * 所以分片上限直接决定「每条连接吃多少内存」：
+ *   4MB × 128 并发 = 512MB  → Android 必 OOM
+ *   1MB × 128 并发 = 128MB  → 安全
+ *
+ * 而且 1MB 片在 100MB+ 的文件上依然只占 1% 的分片数量，
+ * 不会因为请求变多而明显拖慢速度（RTT 摊薄效果在 1MB 上已经足够）。
+ * 配合 MemoryBudget 的并发限制，大小文件都能稳。
+ */
+internal const val MAX_SLICE_TARGET = 1 * 1024 * 1024
 
 /**
  * 分配下一段活儿：优先拿现成的；拿不到而连接还闲着，就从末尾切一刀。
@@ -1671,6 +1714,18 @@ private suspend fun fetchSlice(
     throw lastError
 }
 
+/**
+ * 把一片数据写进文件的指定偏移。
+ *
+ * `RandomAccessFile` 的 seek + write 不是原子操作，多个 worker 必须串行 —— 
+ * 否则两个 worker 交替 seek 会让数据写串位置（比缺字节更糟：字节数还对，
+ * 内容全乱）。所以这里必须加锁。
+ *
+ * 但锁的粒度要注意：分片上限已经从 4MB 降到 1MB，单次持锁写入时间很短
+ *（本地闪存 1MB 约 1~3ms），不会把并发吞吐串行化。
+ * 如果以后还想优化，正确方向是每片写独立临时文件再拼接，
+ * 而不是在这里放宽锁 —— 那是用正确性换性能。
+ */
 private fun writeAt(output: RandomAccessFile, offset: Long, data: ByteArray, length: Int) {
     synchronized(output) {
         output.seek(offset)

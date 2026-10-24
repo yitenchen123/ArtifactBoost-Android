@@ -221,10 +221,18 @@ class GitHubClient(val token: String) {
         val url = makeUrl(path)
         var lastError: Throwable = GitHubException.DownloadUrlNotFound
 
-        // 先试 HEAD（最快，不产生正文传输），拿不到 302 再退回 GET
+        // 先试 HEAD（最快，不产生正文传输），拿不到 302 再退回 GET。
+        //
+        // **关键**：GET 回退必须带 `Range: bytes=0-0`。
+        // 有些 CDN 对 HEAD 返回 405，这时会走 GET —— 而裸 GET 会把
+        // **整个文件正文拉一遍**才读到 302/200，大文件下就是「解析地址巨慢」
+        // 的元凶（几百 MB 的产物等于先完整下载一次）。带上 Range 只要 1 字节。
         for ((index, method) in listOf("HEAD", "GET").withIndex()) {
             val builder = authorizedRequest(url)
             builder.method(method, null)
+            if (method == "GET") {
+                builder.header("Range", "bytes=0-0")
+            }
             extraHeaders.forEach { (key, value) -> builder.header(key, value) }
 
             try {

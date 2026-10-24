@@ -7,6 +7,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.ConcurrentHashMap
@@ -38,8 +39,17 @@ internal object RouteProbeCache {
     /** 缓存有效期：镜像的可用性变化很快，5 分钟是个折中 */
     private const val TTL_MS = 300_000L
 
-    /** 探测超时（秒）：探测本身必须快，慢了就等于把「解析慢」原样搬过来 */
+    /** 单条通道探测超时（秒）：探测本身必须快，慢了就等于把「解析慢」原样搬过来 */
     private const val TIMEOUT_SECONDS = 2L
+
+    /**
+     * 整轮探测的总预算（毫秒）。
+     *
+     * 探测的**目的是让下载更快开始**，不能反过来变成「先卡两秒」。
+     * 到点就用已经回来的结果做排序，没回来的当不可用处理。
+     * 1.2s 大约是一次跨洋 RTT 的 3~5 倍，足够大多数镜像应答。
+     */
+    private const val TOTAL_BUDGET_MS = 1_200L
 
     /** 探测时只拉一小段，够判断连通性和粗测速度就行 */
     private const val PROBE_BYTES = 32 * 1024
@@ -84,6 +94,10 @@ internal object RouteProbeCache {
      * 立刻量出「响应延迟」和「这一小段的速度」。
      * 全部并行，总耗时约等于最快那条的耗时（≈ RTT），而不是最慢那条。
      *
+     * **总预算**：整体最多等 [TOTAL_BUDGET_MS]。到点还没回来的通道直接按
+     * 「不可用」处理 —— 探测是为了让下载**更快开始**，绝不能反过来变成
+     * 「先卡两秒」。已返回的结果照样能用，不会白等。
+     *
      * @param routes 与 [routeUrls] 一一对应的通道
      * @return 按「可用优先 → 速度快优先 → 延迟低优先」排好序的探测结果
      */
@@ -91,10 +105,23 @@ internal object RouteProbeCache {
         if (routes.size != routeUrls.size || routes.isEmpty()) return emptyList()
 
         val results = coroutineScope {
-            routes.mapIndexed { index, route ->
+            val deferred = routes.mapIndexed { index, route ->
                 async(Dispatchers.IO) { probeOne(route, routeUrls[index]) }
-            }.awaitAll()
+            }
+            // 给整体探测加一个总预算：超时就把还没回来的取消掉，
+            // 只保留已经完成的结果（它们已经够用来排序了）。
+            val completed = withTimeoutOrNull(TOTAL_BUDGET_MS) { deferred.awaitAll() }
+            if (completed != null) {
+                completed
+            } else {
+                deferred.forEach { if (it.isActive) it.cancel() }
+                deferred.mapNotNull { d ->
+                    runCatching { if (d.isCompleted) d.getCompleted() else null }.getOrNull()
+                }
+            }
         }
+
+        if (results.isEmpty()) return emptyList()
 
         return results.sortedWith(
             compareByDescending<RouteProbeResult> { it.ok }
