@@ -36,8 +36,9 @@ class ResumeTest {
 
     @Test
     fun `越界的旧区间会被忽略，不会造出非法缺口`() {
+        // 90..200 超出了文件长度：整段丢弃（宁可多下一次，也不写到越界位置）
         val gaps = gapsOf(100L, listOf(0L..49L, 90L..200L))
-        assertEquals(listOf(50L..89L), gaps)
+        assertEquals(listOf(50L..99L), gaps)
     }
 
     @Test
