@@ -251,7 +251,7 @@ class DownloadManager(
         client: GitHubClient,
         settings: AccelerationSettings,
     ): DownloadRequest {
-        val start = client.startUrl(item.source)
+        val start = client.startUrl(item.source, item.isPrivate)
         val stableUrl = item.source.ghfastEligibleUrl
         val candidates = settings.candidateRoutes(item.isPrivate, stableUrl)
 

@@ -479,7 +479,9 @@ class DownloadEngine {
             if (boot != null && boot.status !in 200..299) {
                 // 把常见的 GitHub 错误码翻译成人话，而不是笼统的「服务器响应异常」
                 throw when (boot.status) {
-                    401, 403, 404, 410 -> GitHubException.Http(boot.status, "")
+                    // 410 = 产物已被 GitHub 清理，给用户一句明确的话而不是「响应异常」
+                    410 -> GitHubException.ArtifactExpired
+                    401, 403, 404 -> GitHubException.Http(boot.status, "")
                     else -> DownloadException.BadResponse
                 }
             }
