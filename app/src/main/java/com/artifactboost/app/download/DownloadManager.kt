@@ -32,6 +32,9 @@ sealed class DownloadState {
     data object Idle : DownloadState()
     data object Resolving : DownloadState()
     data class Downloading(val progress: DownloadProgress) : DownloadState()
+
+    /** 用户主动暂停：半成品与续传账本都保留，点「继续」从断点接着下 */
+    data class Paused(val progress: DownloadProgress) : DownloadState()
     data class Finished(
         /** 私有暂存目录里的原始文件（引擎直写，多线程落盘用） */
         val file: File,
@@ -64,6 +67,10 @@ class DownloadManager(
 
     private val _items = MutableStateFlow<Map<String, DownloadItem>>(emptyMap())
     val items: StateFlow<Map<String, DownloadItem>> = _items.asStateFlow()
+
+    /** 最近一帧进度：暂停时用它渲染「已下 X%，点继续接着下」 */
+    private val _lastProgress = MutableStateFlow<Map<String, DownloadProgress>>(emptyMap())
+    val lastProgress: StateFlow<Map<String, DownloadProgress>> = _lastProgress.asStateFlow()
 
     private val engines = mutableMapOf<String, DownloadEngine>()
     private val jobs = mutableMapOf<String, Job>()
@@ -123,7 +130,11 @@ class DownloadManager(
                     )
             } catch (e: Exception) {
                 if (isCancellation(e)) {
-                    _states.value = _states.value + (item.id to DownloadState.Idle)
+                    // 取消有两种：用户点了暂停（状态已经是 Paused，别覆盖），
+                    // 以及用户点了取消（回 Idle）
+                    if (_states.value[item.id] !is DownloadState.Paused) {
+                        _states.value = _states.value + (item.id to DownloadState.Idle)
+                    }
                 } else {
                     _states.value = _states.value + (item.id to DownloadState.Failed(e.message ?: "下载失败"))
                 }
@@ -134,11 +145,25 @@ class DownloadManager(
         }
     }
 
+    /** 暂停：掐断连接但**保留**半成品与续传账本，点「继续」从断点接着下 */
+    fun pause(item: DownloadItem) {
+        val progress = _lastProgress.value[item.id] ?: DownloadProgress()
+        _states.value = _states.value + (item.id to DownloadState.Paused(progress))
+        engines[item.id]?.cancel()
+        jobs[item.id]?.cancel()
+        jobs.remove(item.id)
+        engines.remove(item.id)
+        _routeSummary.value = _routeSummary.value - item.id
+    }
+
     fun cancel(item: DownloadItem) {
         engines[item.id]?.cancel()
         jobs[item.id]?.cancel()
         jobs.remove(item.id)
         engines.remove(item.id)
+        // 用户主动取消：连同半成品一起清掉，不恢复
+        ResumeStore.discard(item.id)
+        _lastProgress.value = _lastProgress.value - item.id
         _states.value = _states.value + (item.id to DownloadState.Idle)
     }
 
@@ -147,6 +172,8 @@ class DownloadManager(
         jobs[item.id]?.cancel()
         engines.remove(item.id)
         jobs.remove(item.id)
+        ResumeStore.discard(item.id)
+        _lastProgress.value = _lastProgress.value - item.id
         _states.value = _states.value - item.id
         _routeSummary.value = _routeSummary.value - item.id
         _items.value = _items.value - item.id
@@ -166,24 +193,18 @@ class DownloadManager(
 
     private companion object {
 
-        /**
-         * 解析签名地址单次限时：该阶段永远直连 api.github.com，
-         * OkHttp 侧已有 30s callTimeout，这里是防线程池排队等意外情况的第二道保险。
-         */
-        const val RESOLVE_TIMEOUT_MS = 30_000L
-
-        /** 解析重试前退避：抖动网络下立刻重打大概率再撞上，歇 1.5s 再试更划算 */
-        const val RESOLVE_RETRY_DELAY_MS = 1_500L
+        /** 失败重试前的退避：抖动网络下立刻重打大概率再撞上，歇一下更划算 */
+        const val RETRY_DELAY_MS = 800L
     }
 
     // MARK: - 下载主流程
 
     /**
-     * 解析签名地址 → 选通道 → 下载。
-     * 签名地址有时效，整体失败后重新解析再试一次。
+     * IDM 式的下载流程：**没有「解析地址」这一阶段**。
      *
-     * 解析阶段永远直连 api.github.com（通道只影响下载阶段），弱网下单次可达 30s；
-     * 这里做了三件事避免“一直转”：单次 30s 限时、重试前退避 1.5s、重试时刷出明确文案。
+     * 第一个带 Range 的请求直接打到「github.com 稳定地址 / codeload / api.github.com」，
+     * 由引擎在同一个往返里完成：跟随 302 拿签名地址、读出体积、拿回首块数据。
+     * 用户点下去到出速度只差一个 RTT，而不是老实现那样排四段队。
      */
     private suspend fun performDownload(
         item: DownloadItem,
@@ -191,131 +212,79 @@ class DownloadManager(
         engine: DownloadEngine,
         settings: AccelerationSettings,
     ): File {
+        val request = makeRequest(item, client, settings)
         var lastError: Throwable = DownloadException.BadResponse
         for (attempt in 0 until 2) {
             try {
                 if (attempt > 0) {
-                    // 让用户看出来是在重试，而不是卡死；文案见 DownloadItemRow 的 Resolving 分支
-                    setRouteSummary(item.id, "正在解析下载地址（重试 $attempt/1）…")
-                    delay(RESOLVE_RETRY_DELAY_MS)
+                    setRouteSummary(item.id, "网络抖动，正在重试…")
+                    delay(RETRY_DELAY_MS)
                 }
-                val signed = withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
-                    client.resolveDownloadUrl(item.source)
+                val result = engine.download(request, outputDir) { progress ->
+                    _lastProgress.value = _lastProgress.value + (item.id to progress)
+                    _states.value = _states.value + (item.id to DownloadState.Downloading(progress))
                 }
-                if (signed == null) {
-                    // withTimeoutOrNull 在协程被取消时同样返回 null：先把取消抛出去，
-                    // 否则会被包装成“超时”再白跑一次重试。
-                    coroutineContext.ensureActive()
-                    throw java.net.SocketTimeoutException(
-                        "解析下载地址超时（30s）：直连 api.github.com 太慢，请检查网络后重试",
-                    )
-                }
-                // 解析成功：清掉可能存在的“重试…”文案，后面下载会刷自己的说明
-                _routeSummary.value = _routeSummary.value - item.id
-                return runDownload(item, engine, signed, settings)
+                setRouteSummary(item.id, "${describe(request.routes)} · 平均 ${formatSpeed(result.averageSpeed)}")
+                _lastProgress.value = _lastProgress.value - item.id
+                return result.file
             } catch (e: Exception) {
-                if (!shouldRetry(e)) throw e
+                if (isCancellation(e)) throw e
                 lastError = e
-                if (attempt == 0) {
-                    _states.value = _states.value + (item.id to DownloadState.Resolving)
-                }
+                if (!shouldRetry(e)) throw e
             }
         }
         throw lastError
     }
 
-    private suspend fun runDownload(
+    /** 组装引擎输入：**全程零网络请求**，地址是拼出来的，不是问出来的 */
+    private fun makeRequest(
         item: DownloadItem,
-        engine: DownloadEngine,
-        signedUrl: String,
+        client: GitHubClient,
         settings: AccelerationSettings,
-    ): File {
-        // ghfast 这类镜像只认 github.com 原始地址，套签名地址会被拒，
-        // 所以「这条通道该套哪个 URL」必须逐条算，不能统一用 signedUrl。
-        val githubUrl = item.source.ghfastEligibleUrl
+    ): DownloadRequest {
+        val start = client.startUrl(item.source)
+        val stableUrl = item.source.ghfastEligibleUrl
+        val candidates = settings.candidateRoutes(item.isPrivate, stableUrl)
 
-        val candidates = settings.candidateRoutes(item.isPrivate, githubUrl)
-        val basePlan: List<ScoredRoute> = candidates.map { ScoredRoute(it, 1.0) }
-        var routeUrls = resolveRouteUrls(basePlan, signedUrl, githubUrl)
-
-        // 通道探测（已探过的 5 分钟内直接复用）：
-        // 老实现是「按设置里的固定顺序串行先用第一条」，4 个镜像里前 3 个是死的
-        // 就得干等三次超时 —— 用户体感就是「下不动 / 半天才开始」。
-        // 现在同时探测所有候选，可用的先上岗，死的立刻剔除，并把实测速度
-        // 作为初始权重喂给引擎（不再是从均等的 1 开始瞎试）。
-        val plan: List<ScoredRoute>
-        if (candidates.size > 1) {
-            val host = runCatching { java.net.URI(signedUrl).host }.getOrNull()
-            val cached = host?.let { RouteProbeCache.cached(it) }
-            if (cached != null) {
-                // 缓存里可能混有「这次不适用」的通道（比如 ghfast 只对发行版有效），
-                // 按本次候选过滤一遍再用，避免把无关通道塞回计划。
-                val names = candidates.map { it.name }.toSet()
-                val filtered = cached.filter { it.route.name in names }
-                plan = planFromProbes(filtered, candidates)
-            } else {
-                setRouteSummary(item.id, "正在探测最快通道…")
-                val probes = RouteProbeCache.probe(candidates, routeUrls.map { it.second })
-                if (host != null) RouteProbeCache.store(probes, host)
-                plan = planFromProbes(probes, candidates)
-            }
-            // 探测后按新的顺序重排 URL，保证 plan 与 routeUrls 一一对应
-            routeUrls = plan.map { scored ->
-                when (scored.route.scope) {
-                    RouteScope.ANY -> scored.route to scored.route.apply(signedUrl)
-                    RouteScope.GITHUB_ONLY -> {
-                        val base = githubUrl ?: signedUrl
-                        scored.route to scored.route.apply(base)
-                    }
-                }
-            }
-            _routeSummary.value = _routeSummary.value - item.id
-        } else {
-            plan = basePlan
+        // 探测结果只做「锦上添花」：有缓存直接用（0 延迟），
+        // 没缓存也绝不为了排序把开始时间往后推 —— 引擎会边下边学。
+        var plan: List<ScoredRoute> = candidates.map { ScoredRoute(it, 1.0) }
+        val host = runCatching { java.net.URI(start.url).host }.getOrNull()
+        val cached = host?.let { RouteProbeCache.cached(it) }
+        if (candidates.size > 1 && cached != null) {
+            val names = candidates.map { it.name }.toSet()
+            plan = planFromProbes(cached.filter { it.route.name in names }, candidates)
+        } else if (candidates.size > 1 && item.source.supportsChunkedDownload) {
+            warmProbe(start.url, candidates, stableUrl)
         }
 
-        val note: String = if (item.isPrivate && settings.mode == RouteMode.SMART) {
-            "直连（私有仓库不走镜像）"
-        } else {
-            describe(plan)
+        return DownloadRequest(
+            startUrl = start.url,
+            stableUrl = stableUrl,
+            routes = plan,
+            authToken = client.token,
+            startHeaders = start.headers,
+            fileName = item.fileName,
+            connections = settings.clampedConnections,
+            allowChunking = item.source.supportsChunkedDownload,
+            resumeKey = item.id,
+        )
+    }
+
+    /** 后台预热通道探测：不阻塞本次下载，只为下一次（或下一个附件）省掉试错 */
+    private fun warmProbe(startUrl: String, routes: List<DownloadRoute>, stableUrl: String?) {
+        val host = runCatching { java.net.URI(startUrl).host }.getOrNull() ?: return
+        val urls = routes.map { route ->
+            when (route.scope) {
+                RouteScope.ANY -> route.apply(startUrl)
+                RouteScope.GITHUB_ONLY -> route.apply(stableUrl ?: startUrl)
+            }
         }
-
-        val connections = settings.clampedConnections
-        val outputDir = outputDir
-        // 源码包由 GitHub 现场打包，通常不支持 Range；但引擎会自己探测，
-        // 真拿到 206 就自动升级成多线程，所以这里只是「别抱太大期望」的提示
-        val mayChunk = item.source.supportsChunkedDownload
-
-        return try {
-            val result = engine.download(
-                routeUrls = routeUrls,
-                routes = plan,
-                fileName = item.fileName,
-                connections = connections,
-                outputDir = outputDir,
-                allowChunking = mayChunk,
-            ) { progress ->
-                _states.value = _states.value + (item.id to DownloadState.Downloading(progress))
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                val probes = RouteProbeCache.probe(routes, urls)
+                if (probes.any { it.ok }) RouteProbeCache.store(probes, host)
             }
-            setRouteSummary(item.id, "$note · 平均 ${formatSpeed(result.averageSpeed)}")
-            result.file
-        } catch (e: Exception) {
-            // 通道可能失效/被限流，整体回退直连再试一次
-            if (!shouldRetry(e) || plan.none { !it.route.isDirect }) throw e
-            // 顺带把探测缓存清掉：这次全军覆没说明排序已经不适用了
-            RouteProbeCache.invalidateAll()
-            val result = engine.download(
-                routeUrls = listOf(DownloadRoute.DIRECT to signedUrl),
-                routes = listOf(ScoredRoute(DownloadRoute.DIRECT, 1.0)),
-                fileName = item.fileName,
-                connections = connections,
-                outputDir = outputDir,
-                allowChunking = mayChunk,
-            ) { progress ->
-                _states.value = _states.value + (item.id to DownloadState.Downloading(progress))
-            }
-            setRouteSummary(item.id, "直连（$note 失败已回退） · 平均 ${formatSpeed(result.averageSpeed)}")
-            result.file
         }
     }
 
@@ -324,9 +293,8 @@ class DownloadManager(
      *
      * 规则：
      *  - 探测可用的通道按实测速度给权重（引擎一开始就把活儿压到真正的快线上）；
-     *  - 探测不可用的通道剔除，但**直连永远保留**（引擎的最终兜底依赖它，
-     *    而且探测失败也可能只是那一次握手抖动）；
-     *  - 全部不可用时保留原样，让引擎自己按老逻辑兜底。
+     *  - 探测不可用的通道剔除，但**直连永远保留**（引擎的最终兜底依赖它）；
+     *  - 全部不可用时保留原样，让引擎自己兜底。
      */
     private fun planFromProbes(
         probes: List<RouteProbeResult>,
@@ -340,31 +308,6 @@ class DownloadManager(
         }
         val source = if (usable.isEmpty()) probes else usable
         return source.map { ScoredRoute(it.route, maxOf(it.speed, 1.0)) }
-    }
-
-    /**
-     * 给每条通道算出实际请求的 URL。
-     *
-     * - [RouteScope.GITHUB_ONLY]（ghfast）：套 `https://github.com/...` 稳定地址；
-     *   若这次下载没有稳定地址，就把这条通道剔掉（避免送上去必然 400）。
-     * - 其余通道：套已签名的真实地址（原来的行为）。
-     */
-    private fun resolveRouteUrls(
-        plan: List<ScoredRoute>,
-        signedUrl: String,
-        githubUrl: String?,
-    ): List<Pair<DownloadRoute, String>> {
-        val urls = plan.mapNotNull { scored ->
-            when (scored.route.scope) {
-                RouteScope.ANY -> scored.route to scored.route.apply(signedUrl)
-                RouteScope.GITHUB_ONLY -> {
-                    val base = githubUrl ?: return@mapNotNull null
-                    scored.route to scored.route.apply(base)
-                }
-            }
-        }
-        // 全被剔掉（理论上不会，因为直连永远是 ANY）时至少保底直连
-        return urls.ifEmpty { listOf(DownloadRoute.DIRECT to signedUrl) }
     }
 
     private fun setRouteSummary(id: String, text: String) {

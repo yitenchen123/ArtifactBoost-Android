@@ -38,6 +38,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -60,6 +61,7 @@ import com.artifactboost.app.ui.components.brandGradient
 import com.artifactboost.app.ui.theme.AppColors
 import com.artifactboost.app.ui.theme.AppTheme
 import com.artifactboost.app.util.formatBytes
+import com.artifactboost.app.util.formatDuration
 
 /** 按下载类型取语义色 */
 fun sourceColor(source: DownloadSource, colors: AppColors): Color = when (source) {
@@ -210,12 +212,16 @@ fun DownloadItemRow(
                         color = colors.blue,
                         strokeWidth = 2.dp,
                     )
-                    Text(summary ?: "正在解析下载地址…", fontSize = 12.sp, color = colors.muted)
+                    Text(summary ?: "正在连接 GitHub…", fontSize = 12.sp, color = colors.muted)
                 }
             }
 
             is DownloadState.Downloading -> {
                 DownloadingSection(item = item, progress = state.progress, summary = summary)
+            }
+
+            is DownloadState.Paused -> {
+                PausedSection(item = item, progress = state.progress)
             }
 
             is DownloadState.Finished -> {
@@ -364,6 +370,22 @@ private fun DownloadingSection(
                 Spacer(Modifier.weight(1f))
                 SpeedBadge(progress.speedBytesPerSecond)
             }
+            val etaText = formatDuration(progress.etaSeconds)
+            if (etaText != null || progress.resumedBytes > 0) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (etaText != null) {
+                        Text("剩余 $etaText", fontSize = 10.sp, color = colors.subtle)
+                    }
+                    if (progress.resumedBytes > 0) {
+                        Text(
+                            "· 已续传 ${formatBytes(progress.resumedBytes)}",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = colors.green,
+                        )
+                    }
+                }
+            }
         } else {
             // 探测不到体积（单连接流式）：给不确定进度的动画条 + 速度
             Row(
@@ -433,6 +455,12 @@ private fun DownloadingSection(
             }
             Spacer(Modifier.weight(1f))
             TextButton(
+                onClick = { downloads.pause(item) },
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+            ) {
+                Text("暂停", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = colors.orange)
+            }
+            TextButton(
                 onClick = { downloads.cancel(item) },
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
             ) {
@@ -449,5 +477,68 @@ private fun DownloadingSection(
             diagnostics = diagnostics,
             onDismiss = { showDetails = false },
         )
+    }
+}
+
+/** 暂停态：保留半成品，点「继续下载」从断点接着下 */
+@Composable
+private fun PausedSection(
+    item: DownloadItem,
+    progress: com.artifactboost.app.download.DownloadProgress,
+) {
+    val colors = AppTheme.colors
+    val context = LocalContext.current
+    val downloads = ArtifactBoostApp.instance.downloads
+
+    Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
+        if (progress.totalBytes > 0) {
+            GradientProgressBar(fraction = progress.fraction, height = 9.dp, stalled = false)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "${(progress.fraction * 100).toInt()}%",
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace,
+                    color = colors.strongText,
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    "${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}",
+                    fontSize = 11.sp,
+                    color = colors.muted,
+                )
+                Spacer(Modifier.weight(1f))
+                StatusPill("已暂停", colors.orange)
+            }
+        } else {
+            Text("已暂停", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = colors.orange)
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Button(
+                onClick = {
+                    downloads.start(item, AccelerationSettings.load(context))
+                    com.artifactboost.app.download.DownloadService.start(context)
+                },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(40.dp),
+                shape = MaterialTheme.shapes.small,
+                colors = ButtonDefaults.buttonColors(containerColor = colors.green, contentColor = Color.White),
+            ) {
+                Text("继续下载", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+            Button(
+                onClick = { downloads.cancel(item) },
+                modifier = Modifier.height(40.dp),
+                shape = MaterialTheme.shapes.small,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = colors.red.copy(alpha = 0.12f),
+                    contentColor = colors.red,
+                ),
+            ) {
+                Text("取消", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+        }
     }
 }
