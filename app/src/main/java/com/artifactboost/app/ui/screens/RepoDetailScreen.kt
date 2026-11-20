@@ -24,6 +24,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.TrendingUp
 import androidx.compose.material.icons.automirrored.filled.CallSplit
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Lock
@@ -83,6 +84,7 @@ import com.artifactboost.app.ui.theme.AppColors
 import com.artifactboost.app.ui.theme.AppTheme
 import com.artifactboost.app.util.formatBytes
 import com.artifactboost.app.util.formatCount
+import com.artifactboost.app.util.formatReleaseDate
 import com.artifactboost.app.util.formatRelative
 import com.artifactboost.app.util.formatTimestamp
 import com.artifactboost.app.util.parseIso8601
@@ -140,6 +142,14 @@ fun RepoDetailScreen(
         try {
             when (target) {
                 RepoTab.OVERVIEW -> {
+                    // 概览页要展示「最新发行版」入口，顺带拉一次 releases；
+                    // 失败时静默跳过，不能因为发行版接口报错就让 README 显示不出来。
+                    if (!releasesLoaded || force) {
+                        runCatching { client.releases(repo) }.onSuccess {
+                            releases = it
+                            releasesLoaded = true
+                        }
+                    }
                     if (readme != null && !force) return
                     readmeLoading = true
                     readmeFailed = false
@@ -295,7 +305,11 @@ fun RepoDetailScreen(
 
             when (tab) {
                 RepoTab.OVERVIEW -> item {
-                    Box(Modifier.padding(16.dp)) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                    Box {
                         when {
                             readmeLoading && readme == null -> CardSurface { SkeletonBlock(6) }
                             readme != null -> CardSurface(padding = 0.dp) {
@@ -330,6 +344,47 @@ fun RepoDetailScreen(
                                 )
                             }
                         }
+                    }
+
+                    latestReleaseOf(releases)?.let { latest ->
+                        CardSurface(padding = 0.dp) {
+                            Column {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text("发行版", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = colors.strongText)
+                                    Spacer(Modifier.weight(1f))
+                                    TextButton(
+                                        onClick = { tabIndex = RepoTab.RELEASES.ordinal },
+                                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                                    ) {
+                                        Text(
+                                            "全部 ${releases.size} 个",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = colors.blue,
+                                        )
+                                    }
+                                }
+                                Hairline()
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    ReleaseRowContent(
+                                        release = latest,
+                                        isLatest = isLatestRelease(releases, latest),
+                                        onClick = { onOpenRelease(latest) },
+                                    )
+                                }
+                            }
+                        }
+                    }
                     }
                 }
 
@@ -373,15 +428,32 @@ fun RepoDetailScreen(
                             }
                         }
                     }
-                    else -> items(releases, key = { it.id }) { release ->
-                        Box(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                            CardSurface(padding = 0.dp) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 14.dp, vertical = 11.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) { ReleaseRowContent(release = release, onClick = { onOpenRelease(release) }) }
+                    else -> {
+                        item {
+                            Text(
+                                "全部发行版",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = colors.muted,
+                                modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 2.dp),
+                            )
+                        }
+                        items(releases, key = { it.id }) { release ->
+                            Box(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+                                CardSurface(padding = 0.dp) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        ReleaseRowContent(
+                                            release = release,
+                                            isLatest = isLatestRelease(releases, release),
+                                            onClick = { onOpenRelease(release) },
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -617,39 +689,62 @@ fun RunRowContent(run: GHWorkflowRun, onClick: () -> Unit) {
     }
 }
 
-/** 单个 Release 的行内容 */
+/** GitHub 只把「最新的非草稿、非预发布」标为最新发行版 */
+private fun latestReleaseOf(releases: List<GHRelease>): GHRelease? =
+    releases.firstOrNull { !it.draft && !it.prerelease } ?: releases.firstOrNull()
+
+private fun isLatestRelease(releases: List<GHRelease>, release: GHRelease): Boolean {
+    val latest = latestReleaseOf(releases) ?: return false
+    return latest.id == release.id && !release.draft && !release.prerelease
+}
+
+/** 单个 Release 的行内容（对齐 GitHub 移动端：版本 + 相对时间 · 最新发行版 / 预发行） */
 @Composable
-fun ReleaseRowContent(release: GHRelease, onClick: () -> Unit) {
+fun ReleaseRowContent(
+    release: GHRelease,
+    isLatest: Boolean = false,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val colors = AppTheme.colors
     val totalSize = release.assets.sumOf { it.size }
+    val dateText = formatReleaseDate(release.publishedAt)
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
             .clickable(onClick = onClick),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        IconBadge(Icons.Filled.CheckCircle, colors.purple)
-        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            Text(release.displayName, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = colors.strongText, maxLines = 2)
-            if (release.assets.isNotEmpty()) {
-                Text(
-                    "${release.tagName} · ${release.assets.size} 个附件 · ${formatBytes(totalSize)}",
-                    fontSize = 11.sp,
-                    color = colors.subtle,
-                )
-            } else {
-                Text(release.tagName, fontSize = 11.sp, color = colors.subtle)
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.weight(1f)) {
+            Text(release.displayName, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = colors.strongText, maxLines = 2)
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
+                dateText?.let {
+                    Text(it, fontSize = 13.sp, color = colors.muted)
+                    Text("·", fontSize = 13.sp, color = colors.subtle)
+                }
+                val statusText: String
+                val statusColor: androidx.compose.ui.graphics.Color
+                when {
+                    isLatest -> { statusText = "最新发行版"; statusColor = colors.green }
+                    release.prerelease -> { statusText = "预发行"; statusColor = colors.orange }
+                    release.draft -> { statusText = "草稿"; statusColor = colors.muted }
+                    else -> { statusText = "正式版"; statusColor = colors.muted }
+                }
+                Text(statusText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = statusColor)
+                if (release.assets.isNotEmpty()) {
+                    Text("·", fontSize = 13.sp, color = colors.subtle)
+                    Text(formatBytes(totalSize), fontSize = 13.sp, color = colors.subtle)
+                }
             }
-            formatTimestamp(release.publishedAt)?.let { Text(it, fontSize = 11.sp, color = colors.subtle) }
         }
-        Spacer(Modifier.weight(1f))
-        when {
-            release.prerelease -> StatusPill("预发布", colors.orange)
-            release.draft -> StatusPill("草稿", colors.subtle)
-            else -> StatusPill("发行版", colors.green)
-        }
+        Icon(
+            Icons.AutoMirrored.Filled.KeyboardArrowRight,
+            contentDescription = null,
+            tint = colors.subtle,
+            modifier = Modifier.size(18.dp),
+        )
     }
 }
 

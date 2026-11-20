@@ -88,3 +88,16 @@ fun parseIso8601(raw: String?): Long? {
 /** 解析后直接格式化为相对时间，失败返回 null */
 fun formatTimestamp(iso: String?): String? =
     parseIso8601(iso)?.let { formatTimestamp(it) }
+
+/**
+ * 发行版日期（对齐 GitHub 移动端）：
+ * 一个月内显示相对时间并去掉「前」（如「4 小时」），更早显示「2026年8月24日」。
+ */
+fun formatReleaseDate(iso: String?): String? {
+    val millis = parseIso8601(iso) ?: return null
+    val interval = System.currentTimeMillis() - millis
+    if (interval in 0 until 30L * 24 * 3600 * 1000) {
+        return formatRelative(millis).removeSuffix("前")
+    }
+    return SimpleDateFormat("yyyy年M月d日", Locale.getDefault()).format(Date(millis))
+}
