@@ -75,6 +75,9 @@ class DownloadManager(
     private val engines = mutableMapOf<String, DownloadEngine>()
     private val jobs = mutableMapOf<String, Job>()
 
+    /** 每次 start 递增：暂停后立刻「继续」时，旧任务的收尾不能误删新一代的引擎/任务引用 */
+    private val generations = mutableMapOf<String, Int>()
+
     /** 引擎落盘用的私有暂存目录；完成后会自动复制一份到系统公共下载目录 */
     val outputDir: File
         get() = File(appContext.getExternalFilesDir(null) ?: appContext.filesDir, "Artifacts")
@@ -110,6 +113,8 @@ class DownloadManager(
 
         val engine = DownloadEngine()
         engines[item.id] = engine
+        val generation = (generations[item.id] ?: 0) + 1
+        generations[item.id] = generation
 
         jobs[item.id] = scope.launch {
             try {
@@ -139,8 +144,12 @@ class DownloadManager(
                     _states.value = _states.value + (item.id to DownloadState.Failed(e.message ?: "下载失败"))
                 }
             } finally {
-                engines.remove(item.id)
-                jobs.remove(item.id)
+                // 只有「还是这一代任务」才清理；否则会把用户刚点「继续」新建的那一代误删
+                if (generations[item.id] == generation) {
+                    generations.remove(item.id)
+                    engines.remove(item.id)
+                    jobs.remove(item.id)
+                }
             }
         }
     }
