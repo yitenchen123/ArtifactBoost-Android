@@ -1949,28 +1949,29 @@ internal class SlicePool(
     init {
         completed.set(initialCompleted)
         if (gaps != null) {
+            // 断点续传：池子里只放「还缺的区间」，已下好的直接算完成
             gaps.filter { it.first >= 0 && it.last < total && it.first <= it.last }
                 .forEach { queue.add(Entry(Chunk(0, it.first, it.last))) }
-            return
-        }
-        // 预切分：首轮就能派满 lanes 条连接，避免单区间导致的调度饿死（与 iOS 同步）。
-        // 按 lanes*4 均分，尾块吃余数；块太小（<64KB）时自动收敛，避免任务爆炸。
-        // 默认 slices=1 保持旧单测兼容。
-        val target = maxOf(1, slices)
-        if (target <= 1 || total <= 0) {
-            queue.add(Entry(Chunk(0, 0L, total - 1)))
         } else {
-            val maxSlices = maxOf(1, (total / (64 * 1024)).toInt())
-            val count = maxOf(1, minOf(target, maxSlices))
-            if (count <= 1) {
+            // 预切分：首轮就能派满 lanes 条连接，避免单区间导致的调度饿死（与 iOS 同步）。
+            // 按 lanes*4 均分，尾块吃余数；块太小（<64KB）时自动收敛，避免任务爆炸。
+            // 默认 slices=1 保持旧单测兼容。
+            val target = maxOf(1, slices)
+            if (target <= 1 || total <= 0) {
                 queue.add(Entry(Chunk(0, 0L, total - 1)))
             } else {
-                val base = total / count
-                var start = 0L
-                for (i in 0 until count) {
-                    val end = if (i == count - 1) total - 1 else start + base - 1
-                    queue.add(Entry(Chunk(0, start, end)))
-                    start = end + 1
+                val maxSlices = maxOf(1, (total / (64 * 1024)).toInt())
+                val count = maxOf(1, minOf(target, maxSlices))
+                if (count <= 1) {
+                    queue.add(Entry(Chunk(0, 0L, total - 1)))
+                } else {
+                    val base = total / count
+                    var start = 0L
+                    for (i in 0 until count) {
+                        val end = if (i == count - 1) total - 1 else start + base - 1
+                        queue.add(Entry(Chunk(0, start, end)))
+                        start = end + 1
+                    }
                 }
             }
         }
