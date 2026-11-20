@@ -40,6 +40,50 @@ internal class WriteLedger(private val total: Long) {
     val segmentCount: Int get() = synchronized(lock) { ranges.size }
 
     /**
+     * 用上次落盘的覆盖区间初始化账本（断点续传）。
+     *
+     * 与 [record] 的区别：这里是「已知这些字节在文件里」，直接合并即可，
+     * 不参与重叠统计 —— 否则续传一启动就会被判成「重复写入」。
+     */
+    fun seed(incoming: List<LongRange>) {
+        if (incoming.isEmpty()) return
+        synchronized(lock) {
+            for (range in incoming.sortedBy { it.first }) {
+                if (range.first < 0 || range.last >= total || range.first > range.last) continue
+                var mergedStart = range.first
+                var mergedEnd = range.last
+                var index = lowerBound(mergedStart)
+                if (index > 0 && ranges[index - 1].last >= mergedStart - 1) index -= 1
+                val start = index
+                while (index < ranges.size && ranges[index].first <= mergedEnd + 1) {
+                    mergedStart = minOf(mergedStart, ranges[index].first)
+                    mergedEnd = maxOf(mergedEnd, ranges[index].last)
+                    index++
+                }
+                repeat(index - start) { ranges.removeAt(start) }
+                ranges.add(start, mergedStart..mergedEnd)
+            }
+            covered.set(ranges.sumOf { it.last - it.first + 1 })
+        }
+    }
+
+    /** 导出当前已覆盖区间（checkpoint 落盘用） */
+    fun rangesSnapshot(): List<List<Long>> = synchronized(lock) {
+        ranges.map { listOf(it.first, it.last) }
+    }
+
+    /** 有序区间表里第一个起点 >= value 的下标 */
+    private fun lowerBound(value: Long): Int {
+        var lo = 0
+        var hi = ranges.size
+        while (lo < hi) {
+            val mid = (lo + hi) / 2
+            if (ranges[mid].first < value) lo = mid + 1 else hi = mid
+        }
+        return lo
+    }
+
+    /**
      * 登记一次写盘。
      *
      * @return 真正新覆盖的字节数。若该区间已被完全写过，返回 0；

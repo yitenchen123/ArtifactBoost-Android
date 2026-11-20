@@ -88,3 +88,29 @@ fun parseIso8601(raw: String?): Long? {
 /** 解析后直接格式化为相对时间，失败返回 null */
 fun formatTimestamp(iso: String?): String? =
     parseIso8601(iso)?.let { formatTimestamp(it) }
+
+/** 剩余时间：42 秒 / 3 分 12 秒 / 1 小时 04 分；无效时返回 null（界面据此隐藏） */
+fun formatDuration(seconds: Double): String? {
+    if (!seconds.isFinite() || seconds < 1) return null
+    val total = seconds.toLong()
+    if (total < 60) return "$total 秒"
+    if (total < 3600) {
+        val minutes = total / 60
+        val rest = total % 60
+        return if (rest == 0L) "$minutes 分" else "$minutes 分 $rest 秒"
+    }
+    return String.format(Locale.US, "%d 小时 %02d 分", total / 3600, (total % 3600) / 60)
+}
+
+/**
+ * 发行版日期（对齐 GitHub 移动端）：
+ * 一个月内显示相对时间并去掉「前」（如「4 小时」），更早显示「2026年8月24日」。
+ */
+fun formatReleaseDate(iso: String?): String? {
+    val millis = parseIso8601(iso) ?: return null
+    val interval = System.currentTimeMillis() - millis
+    if (interval in 0 until 30L * 24 * 3600 * 1000) {
+        return formatRelative(millis).removeSuffix("前")
+    }
+    return SimpleDateFormat("yyyy年M月d日", Locale.getDefault()).format(Date(millis))
+}

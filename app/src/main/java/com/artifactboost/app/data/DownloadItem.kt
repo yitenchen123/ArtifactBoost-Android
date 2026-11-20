@@ -2,9 +2,15 @@ package com.artifactboost.app.data
 
 import com.artifactboost.app.util.formatTimestamp
 
-enum class ArchiveFormat(val path: String, val fileExtension: String, val title: String) {
-    ZIP("zipball", "zip", "ZIP"),
-    TARBALL("tarball", "tar.gz", "TAR.GZ"),
+enum class ArchiveFormat(
+    val path: String,
+    /** codeload.github.com 用的路径段（源码包直连，不再经过 api.github.com） */
+    val codeloadPath: String,
+    val fileExtension: String,
+    val title: String,
+) {
+    ZIP("zipball", "zip", "zip", "ZIP"),
+    TARBALL("tarball", "tar.gz", "tar.gz", "TAR.GZ"),
 }
 
 /** 能加速下载的东西：构建产物 / 构建日志 / 发行版附件 / 源码包 */

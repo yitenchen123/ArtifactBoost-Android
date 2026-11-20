@@ -46,6 +46,12 @@ enum class RepoSort(val title: String) {
  * 取出真实地址，后续分段下载直接打这个地址——既不再需要 Token，
  * 也不再经过 api.github.com。
  */
+/** 一次下载的「起步地址」：URL + 该地址需要的额外请求头 */
+data class DownloadStart(
+    val url: String,
+    val headers: Map<String, String> = emptyMap(),
+)
+
 class GitHubClient(val token: String) {
 
     private val json = Json {
@@ -200,6 +206,40 @@ class GitHubClient(val token: String) {
      *  2. `followRedirects = false` + 拿到 3xx 就立刻结束 —— 产物是几百 MB 的资源，
      *     走完整个响应体纯属浪费，302 一出现 Location 就有了。
      */
+    /**
+     * 直接可用的「起步地址」：不再先空跑一次 API 解析，
+     * 而是把第一个带 Range 的真实下载请求直接打到这个地址上。
+     *
+     * - 发行版附件：用 github.com 的**稳定公开地址**，连 api.github.com 都不用碰；
+     * - 源码包：走 codeload.github.com，GitHub 现场打包同样支持直连；
+     * - 构建产物 / 日志：必须走 api.github.com（要 Token 才给签名地址）。
+     */
+    fun startUrl(source: DownloadSource): DownloadStart = when (source) {
+        is DownloadSource.ReleaseAsset -> {
+            val browser = source.browserUrl
+            if (!browser.isNullOrBlank()) {
+                DownloadStart(browser)
+            } else {
+                DownloadStart(
+                    url = makeUrl("repos/${source.repo}/releases/assets/${source.assetId}"),
+                    headers = mapOf("Accept" to "application/octet-stream"),
+                )
+            }
+        }
+        is DownloadSource.SourceArchive -> {
+            val encoded = encodePathSegment(source.ref)
+            if (encoded.isEmpty()) {
+                DownloadStart(makeUrl("repos/${source.repo}/${source.format.path}"))
+            } else {
+                DownloadStart("https://codeload.github.com/${source.repo}/${source.format.codeloadPath}/$encoded")
+            }
+        }
+        is DownloadSource.Artifact ->
+            DownloadStart(makeUrl("repos/${source.repo}/actions/artifacts/${source.id}/zip"))
+        is DownloadSource.RunLogs ->
+            DownloadStart(makeUrl("repos/${source.repo}/actions/runs/${source.runId}/logs"))
+    }
+
     suspend fun resolveDownloadUrl(source: DownloadSource): String = withContext(Dispatchers.IO) {
         val extraHeaders = mutableMapOf<String, String>()
         val path = when (source) {

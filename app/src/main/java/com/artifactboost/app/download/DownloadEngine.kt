@@ -1,6 +1,9 @@
 package com.artifactboost.app.download
 
+import com.artifactboost.app.data.DownloadRoute
 import com.artifactboost.app.data.GitHubClient
+import com.artifactboost.app.data.GitHubException
+import com.artifactboost.app.data.RouteScope
 import com.artifactboost.app.data.ScoredRoute
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.CancellationException
@@ -17,6 +20,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
@@ -35,6 +39,10 @@ data class DownloadProgress(
     val totalBytes: Long = 0,
     val fraction: Float = 0f,
     val speedBytesPerSecond: Double = 0.0,
+    /** 按当前平滑速度估算的剩余秒数；速度为 0 或体积未知时为 0 */
+    val etaSeconds: Double = 0.0,
+    /** 本次从断点续传开始：这个值是「上次已下好、这次直接跳过」的字节数 */
+    val resumedBytes: Long = 0,
     /** 分段的实时明细，用于「详细信息」面板；未开始分段时为 null */
     val diagnostics: DownloadDiagnostics? = null,
 )
@@ -140,6 +148,55 @@ data class DownloadResult(
     /** 本次实际吃满的并发数，用于界面说明 */
     val lanes: Int = 1,
 )
+
+/** 起步请求的产物：302 后的真实地址 + 体积 + 首块数据，一个往返拿全 */
+class EngineBootstrap(
+    val data: ByteArray,
+    val total: Long,
+    val chunked: Boolean,
+    val etag: String?,
+    val lastModified: String?,
+    val finalUrl: String,
+    val status: Int,
+)
+
+/** 一次下载的全部输入 */
+data class DownloadRequest(
+    /** 第一个请求直接打这个地址（github.com 稳定地址 / api.github.com / codeload） */
+    val startUrl: String,
+    /** 该下载在 github.com 上的稳定地址：ghfast 这类只认原始地址的镜像要用 */
+    val stableUrl: String? = null,
+    /** 通道计划（含直连）；顺序即初始权重顺序 */
+    val routes: List<ScoredRoute> = emptyList(),
+    /** 仅用于首个请求的 Token：绝不发给第三方镜像 */
+    val authToken: String? = null,
+    /** 首个请求需要的额外请求头（例如附件接口要 Accept） */
+    val startHeaders: Map<String, String> = emptyMap(),
+    val fileName: String,
+    val connections: Int,
+    /** 目标是否可能支持分段（源码包由 GitHub 现场打包，不支持） */
+    val allowChunking: Boolean = true,
+    /** 断点续传的键（下载项 id） */
+    val resumeKey: String? = null,
+)
+
+/** 已覆盖区间的补集：续传时真正要下的那些缺口 */
+internal fun gapsOf(total: Long, covered: List<LongRange>): List<LongRange> {
+    if (total <= 0) return emptyList()
+    val sorted = covered
+        .filter { it.first >= 0 && it.last < total && it.first <= it.last }
+        .sortedBy { it.first }
+    if (sorted.isEmpty()) return listOf(0L..(total - 1))
+    val result = mutableListOf<LongRange>()
+    var cursor = 0L
+    for (range in sorted) {
+        if (range.first > cursor) result.add(cursor..(range.first - 1))
+        cursor = maxOf(cursor, range.last + 1)
+        if (cursor >= total) break
+    }
+    if (cursor < total) result.add(cursor..(total - 1))
+    return result
+}
 
 /** 一个待下载的区间（左闭右闭） */
 internal data class Chunk(
@@ -345,6 +402,22 @@ class DownloadEngine {
     private var cancelled = false
 
     private val clients = mutableListOf<OkHttpClient>()
+
+    /**
+     * 起步请求 / 单连接共用的客户端。
+     *
+     * 关键在于**复用**：老实现每次解析都新建 client 再关掉，
+     * 等于每次都重做 DNS + TCP + TLS 三次握手（弱网下就是 1~2 秒白等）。
+     */
+    private val bootstrapClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .callTimeout(0, TimeUnit.MILLISECONDS)
+            .followRedirects(true)
+            .retryOnConnectionFailure(true)
+            .build()
+    }
     private val allClients = ConcurrentLinkedDeque<OkHttpClient>()
 
     /** 在飞的请求：取消时要一起掐掉，否则线程会卡在 socket read 上很久 */
@@ -364,84 +437,172 @@ class DownloadEngine {
     }
 
     /**
-     * 多通道并行下载。
+     * 多通道并行下载（IDM 式单请求起步）。
      *
-     * @param routeUrls 每条通道 **各自** 要请求的地址（顺序与 [routes] 一一对应）。
-     *        之所以逐条传进来而不是统一套一个签名地址：ghfast 这类镜像只认
-     *        `github.com` 原始地址，套签名地址会被拒。
-     * @param allowChunking 目标是否可能支持分段；为 false 时先走单连接，但在读到 206
-     *        之后依旧会自动升级为分段下载（源码包也有 206 的时候）。
+     * 第一个带 Range 的请求直接打到「github.com 稳定地址 / codeload / api.github.com」，
+     * 由 [fetchBootstrap] 在同一个往返里完成：跟随 302 拿到签名地址、读出文件体积、
+     * 拿回首块数据 —— 不再有独立的「解析地址」「探测体积」两步。
+     * 老链路四段串行、每段新建 OkHttpClient（= 重新握手），这才是「解析慢」的根因。
      */
     suspend fun download(
-        routeUrls: List<Pair<com.artifactboost.app.data.DownloadRoute, String>>,
-        routes: List<ScoredRoute>,
-        fileName: String,
-        connections: Int,
+        request: DownloadRequest,
         outputDir: File,
-        allowChunking: Boolean = true,
         progress: (DownloadProgress) -> Unit,
     ): DownloadResult = withContext(Dispatchers.IO) {
         cancelled = false
         DownloadEngineFlag.cancelled = false
         val startedAt = System.nanoTime()
-        val plan = routes.ifEmpty { listOf(ScoredRoute(com.artifactboost.app.data.DownloadRoute.DIRECT, 1.0)) }
-        val urls = routeUrls.map { it.second }.ifEmpty {
-            listOf(com.artifactboost.app.data.DownloadRoute.DIRECT.apply(""))
-        }
+        val plan = request.routes.ifEmpty { listOf(ScoredRoute(DownloadRoute.DIRECT, 1.0)) }
 
         val tempDir = File(outputDir.parentFile ?: outputDir, "tmp-${System.currentTimeMillis()}")
         if (!tempDir.exists() && !tempDir.mkdirs()) throw DownloadException.BadResponse
         outputDir.mkdirs()
 
-        var outFile = File(outputDir, fileName)
+        var outFile = File(outputDir, request.fileName)
         if (outFile.exists()) {
-            outFile = File(outputDir, "${System.currentTimeMillis().toString().takeLast(6)}-$fileName")
+            outFile = File(outputDir, "${System.currentTimeMillis().toString().takeLast(6)}-${request.fileName}")
         }
 
         try {
-            // 先探测体积 + 确认服务器是否真的支持 Range
-            val probe = if (allowChunking) probeSize(urls) else null
-            val total = probe?.total
-
             // **按可用堆内存限制并发**（大文件的关键修复）。
-            //
-            // 每个分片在 fetchSlice 里会 new 一个 ByteArray(分片大小)，
-            // 而分片大小上限是 MAX_SLICE_TARGET。以前直接按用户设的
-            // 128 并发跑 —— 128 × 4MB = 512MB 的瞬时峰值，
-            // Android 上必然 OOM / 疯狂 GC，表现就是「大文件完全下不动」。
-            //
-            // 现在先按「当前可用堆 / 单分片大小」算出安全并发，再和用户设的上限取小。
             val lanes = MemoryBudget.safeLanes(
-                requested = connections.coerceIn(1, MAX_LANES),
+                requested = request.connections.coerceIn(1, MAX_LANES),
                 bytesPerLane = MAX_SLICE_TARGET.toLong(),
             )
 
-            if (total == null || total <= 0) {
-                // 探测不到体积（不少接口不回 Content-Length）：
-                // 先单连接跑，只要响应是 206 就现场升级成多线程分段
-                val single = downloadSingle(urls.first(), outFile, lanes, progress)
+            // ---- 起步：一个请求同时完成「解析 / 探体积 / 拿首块」----
+            val boot = if (request.allowChunking) {
+                fetchBootstrap(request.startUrl, request.authToken, request.startHeaders)
+            } else {
+                null
+            }
+            if (boot != null && boot.status !in 200..299) {
+                // 把常见的 GitHub 错误码翻译成人话，而不是笼统的「服务器响应异常」
+                throw when (boot.status) {
+                    401, 403, 404, 410 -> GitHubException.Http(boot.status, "")
+                    else -> DownloadException.BadResponse
+                }
+            }
+            val finalUrl = boot?.finalUrl ?: request.startUrl
+            val total = boot?.total ?: 0L
+
+            if (boot?.chunked != true || total < MIN_CHUNKED_TOTAL) {
+                // 不支持分段 / 体积太小 / 探测不到体积：单连接（但依然带真实进度）
+                request.resumeKey?.let { ResumeStore.discard(it) }
+                val single = downloadSingle(finalUrl, outFile, total, progress)
                 val elapsed = maxOf((System.nanoTime() - startedAt) / 1_000_000_000.0, 0.05)
-                return@withContext DownloadResult(single.file, single.bytes / elapsed, single.lanes)
+                return@withContext DownloadResult(single.file, single.bytes / elapsed, 1)
             }
 
-            if (!probe.chunked || total < MIN_CHUNKED_TOTAL) {
-                // 服务器忽略了 Range（返回 200 全量），或者文件太小不值得分段
-                val single = downloadSingle(urls.first(), outFile, lanes, progress)
-                val elapsed = maxOf((System.nanoTime() - startedAt) / 1_000_000_000.0, 0.05)
-                return@withContext DownloadResult(single.file, single.bytes / elapsed, single.lanes)
+            // 断点续传：上次没下完的区间接着下，而不是从 0 重来。
+            // 没有可用记录时也保留一个空上下文 —— 这样本次进度会周期性落盘，
+            // 用户中途被杀进程 / 点暂停后，下次能直接续上。
+            var resume: ResumeContext? = null
+            request.resumeKey?.let { key ->
+                resume = ResumeStore.prepare(key, total, boot?.etag, boot?.lastModified)
+                    ?: ResumeContext(
+                        key = key,
+                        partFile = ResumeStore.partFile(key),
+                        etag = boot?.etag,
+                        lastModified = boot?.lastModified,
+                        covered = emptyList(),
+                    )
             }
 
-            val result = segmentDownload(urls, total, outFile, tempDir, lanes, plan, progress)
+            // 通道地址：用**重定向后的真实地址**给镜像套前缀。
+            // 这样连构建产物这种必须先拿签名地址的情况，也只需要一次解析（就在起步请求里）。
+            val channelUrls = plan.map { scored ->
+                when (scored.route.scope) {
+                    RouteScope.ANY -> scored.route.apply(finalUrl)
+                    RouteScope.GITHUB_ONLY -> scored.route.apply(request.stableUrl ?: finalUrl)
+                }
+            }
+
+            val result = segmentDownload(
+                urls = channelUrls,
+                plan = plan,
+                total = total,
+                outFile = outFile,
+                tempDir = tempDir,
+                lanes = lanes,
+                resume = resume,
+                prefill = boot?.data?.takeIf { it.isNotEmpty() },
+                progress = progress,
+            )
             val elapsed = maxOf((System.nanoTime() - startedAt) / 1_000_000_000.0, 0.05)
             DownloadResult(result, total / elapsed, lanes)
         } catch (e: Throwable) {
-            // 失败时把半成品删掉：留着它只会让用户以为「下载成功了」，
-            // 拿去解压才发现损坏。宁可让他看到明确的失败提示再重试。
-            runCatching { outFile.delete() }
+            // 有续传记录的保留半成品（下次只补缺口）；没有的照旧删掉，避免被误当成成品
+            if (request.resumeKey == null) runCatching { outFile.delete() }
             throw e
         } finally {
             tempDir.deleteRecursively()
         }
+    }
+
+    // MARK: - 起步请求（解析 + 体积 + 首块，一次拿全）
+
+    /**
+     * 发一个 `Range: bytes=0-<BOOTSTRAP_BYTES-1>` 的请求：
+     *  - OkHttp 自动跟随 302，`response.request.url` 就是签名后的真实地址；
+     *  - `Content-Range` 给出文件总长；
+     *  - 首块数据直接留给分段引擎，省掉一次重复下载。
+     */
+    private fun fetchBootstrap(
+        url: String,
+        authToken: String?,
+        headers: Map<String, String>,
+    ): EngineBootstrap? {
+        val builder = Request.Builder()
+            .url(url)
+            .header("Range", "bytes=0-${BOOTSTRAP_BYTES - 1}")
+            .header("User-Agent", GitHubClient.USER_AGENT)
+        headers.forEach { (key, value) -> builder.header(key, value) }
+        // Token 只发给 GitHub 自己的域名，绝不外泄给镜像
+        if (!authToken.isNullOrBlank() && isGitHubHost(url)) {
+            builder.header("Authorization", "Bearer $authToken")
+        }
+
+        val call = bootstrapClient.newCall(builder.build())
+        inflight.register(call)
+        try {
+            call.execute().use { response ->
+                val etag = response.header("ETag")
+                val lastModified = response.header("Last-Modified")
+                val finalUrl = response.request.url.toString()
+                if (response.code != 206) {
+                    // 200（不支持 Range）/ 4xx：正文一律不读，交给上层决定
+                    val total = response.header("Content-Length")?.toLongOrNull() ?: 0L
+                    return EngineBootstrap(ByteArray(0), total, false, etag, lastModified, finalUrl, response.code)
+                }
+                val total = response.header("Content-Range")
+                    ?.substringAfterLast('/')
+                    ?.trim()
+                    ?.toLongOrNull() ?: 0L
+                val body = response.body ?: return null
+                val out = ByteArrayOutputStream(BOOTSTRAP_BYTES)
+                val buffer = ByteArray(64 * 1024)
+                var remaining = BOOTSTRAP_BYTES
+                body.byteStream().use { input ->
+                    while (remaining > 0) {
+                        if (cancelled || DownloadEngineFlag.cancelled) throw DownloadException.Cancelled
+                        val read = input.read(buffer, 0, minOf(buffer.size, remaining))
+                        if (read <= 0) break
+                        out.write(buffer, 0, read)
+                        remaining -= read
+                    }
+                }
+                return EngineBootstrap(out.toByteArray(), total, true, etag, lastModified, finalUrl, response.code)
+            }
+        } finally {
+            inflight.release(call)
+        }
+    }
+
+    private fun isGitHubHost(url: String): Boolean {
+        val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull() ?: return false
+        return host == "github.com" || host.endsWith(".github.com") ||
+            host == "githubusercontent.com" || host.endsWith(".githubusercontent.com")
     }
 
     // MARK: - 分段下载主循环
@@ -463,6 +624,8 @@ class DownloadEngine {
         tempDir: File,
         lanes: Int,
         plan: List<ScoredRoute>,
+        resume: ResumeContext?,
+        prefill: ByteArray?,
         progress: (DownloadProgress) -> Unit,
     ): File {
         // 车道状态看板：worker 实时登记，进度回调每拍取走一份快照。
@@ -470,20 +633,40 @@ class DownloadEngine {
         val board = LaneBoard(lanes)
         // 通道列表在下面才建好，这里先用空引用占位，建好后立刻回填。
         var channelsRef: List<RouteChannel> = emptyList()
-        val accumulator = ProgressAccumulator(total, progress) {
-            // 诊断快照走的是「现取」而不是「定时轮询」：只有真要推进度的那一拍才组数据，
-            // 零额外开销。routes() 里带上各通道实测速度与是否在跑。
-            val active = board.lanesSnapshot().map { it.routeName }.toSet()
-            board.snapshot(
-                channelsRef.map {
-                    RouteStats(
-                        name = it.name,
-                        speedBytesPerSecond = it.measuredSpeed,
-                        isActive = it.name in active,
-                    )
-                },
-            )
+
+        // 续传的旧区间 + 起步请求拿到的首块，都直接算作「已完成」
+        val seededCovered = (resume?.covered ?: emptyList()).toMutableList()
+        var prefillData: ByteArray? = null
+        if (prefill != null && prefill.isNotEmpty()) {
+            val end = prefill.size.toLong() - 1
+            val already = seededCovered.any { it.first <= 0 && it.last >= end }
+            if (!already && end < total) {
+                seededCovered.add(0L..end)
+                prefillData = prefill
+            }
         }
+        val seededBytes = seededCovered.sumOf { it.last - it.first + 1 }
+
+        val accumulator = ProgressAccumulator(
+            total = total,
+            handler = progress,
+            diagnostics = {
+                // 诊断快照走的是「现取」而不是「定时轮询」：只有真要推进度的那一拍才组数据，
+                // 零额外开销。routes() 里带上各通道实测速度与是否在跑。
+                val active = board.lanesSnapshot().map { it.routeName }.toSet()
+                board.snapshot(
+                    channelsRef.map {
+                        RouteStats(
+                            name = it.name,
+                            speedBytesPerSecond = it.measuredSpeed,
+                            isActive = it.name in active,
+                        )
+                    },
+                )
+            },
+            initial = seededBytes,
+            resumedBytes = resume?.coveredBytes ?: 0L,
+        )
 
         // 关键：Cloudflare 这类 CDN 会协商 HTTP/2，所有请求被多路复用到同一条 TCP 连接上，
         // 长链路下单连接带宽就是天花板，开再多「车道」也没用。
@@ -543,7 +726,8 @@ class DownloadEngine {
             .asCoroutineDispatcher()
 
         try {
-            val direct = urls.first()
+            val directIndex = plan.indexOfFirst { it.route.isDirect }.coerceAtLeast(0)
+            val direct = urls[minOf(directIndex, urls.size - 1)]
             val channels = plan.mapIndexed { index, scored ->
                 val primary = urls[minOf(index, urls.size - 1)]
                 // 镜像挂掉/被限流时自动退回直连
@@ -557,18 +741,45 @@ class DownloadEngine {
             }
             channelsRef = channels
 
-            val output = RandomAccessFile(outFile, "rw")
+            // 续传写的是稳定的半成品文件，校验通过后才挪到成品目录
+            val writeFile = resume?.partFile ?: outFile
+            val output = RandomAccessFile(writeFile, "rw")
             output.setLength(total)
+            if (prefillData != null) {
+                output.seek(0)
+                output.write(prefillData)
+            }
 
-            // 预切分 lanes*4：首轮就能派满并发，避免“池子只有 1 个区间→只能派出 1 条”的调度饿死（与 iOS 同步）。
-            val pool = SlicePool(total, lanes * 4)
-            val written = AtomicLong(0)
+            // 续传时池子里只放「还缺的区间」，已下好的直接算完成
+            val pool = SlicePool(total, lanes * 4, gapsOf(total, seededCovered), seededBytes)
+            val written = AtomicLong(seededBytes)
             // 覆盖账本：记录「哪些字节真的被写进文件了」。
             // 以前的完整性校验只有 written == total（总量），
             // 「重复写一段 + 漏写一段」的总量可能相等 —— 文件大小对、内容错，
             // 表现就是「能下完但解压不了」。这个账本把校验升级成覆盖校验。
             val ledger = WriteLedger(total)
+            ledger.seed(seededCovered)
             val startedAt = System.nanoTime()
+
+            // 周期性 checkpoint：进程被杀时内存账本会丢，每 1.5s 落一次盘，
+            // 重启后最多重下 1.5 秒的量。
+            var lastCheckpointAt = 0L
+            fun checkpoint(force: Boolean = false) {
+                val ctx = resume ?: return
+                val now = System.currentTimeMillis()
+                if (!force && now - lastCheckpointAt < 1_500L) return
+                lastCheckpointAt = now
+                ResumeStore.save(
+                    ctx.key,
+                    ResumeMeta(
+                        total = total,
+                        etag = ctx.etag,
+                        lastModified = ctx.lastModified,
+                        ranges = ledger.rangesSnapshot(),
+                        updatedAt = now,
+                    ),
+                )
+            }
 
             // 车道编号只增不减：worker 收工后编号不复用，
             // 这样诊断面板上「车道 #7 干了什么」不会因为复用而张冠李戴。
@@ -599,7 +810,12 @@ class DownloadEngine {
 
                     while (true) {
                         // 取消后立刻退出调度循环，不再派新活儿
-                        if (cancelled || DownloadEngineFlag.cancelled) throw DownloadException.Cancelled
+                        if (cancelled || DownloadEngineFlag.cancelled) {
+                            checkpoint(force = true)
+                            throw DownloadException.Cancelled
+                        }
+                        // 每 1.5s 落一次盘：被杀进程时最多损失 1.5 秒的量
+                        checkpoint()
 
                         // 无进展保护。判据是「池子里还有活儿（在跑 或 在退避）却一直没涨」，
                         // 不能只看 jobs 是否为空 —— 全部区间都在退避时 jobs 可能是空的，
@@ -737,7 +953,10 @@ class DownloadEngine {
                 // 区间重新塞回池子再下一次，能救回来的就不该让用户重下几百 MB。
                 var repairRound = 0
                 while (!ledger.isComplete() && repairRound < MAX_REPAIR_ROUNDS) {
-                    if (cancelled || DownloadEngineFlag.cancelled) throw DownloadException.Cancelled
+                    if (cancelled || DownloadEngineFlag.cancelled) {
+                        checkpoint(force = true)
+                        throw DownloadException.Cancelled
+                    }
 
                     val gaps = ledger.gaps(limit = MAX_REPAIR_RANGES)
                     if (gaps.isEmpty()) break
@@ -763,7 +982,11 @@ class DownloadEngine {
                         var lastGapAt = System.nanoTime()
 
                         while (true) {
-                            if (cancelled || DownloadEngineFlag.cancelled) throw DownloadException.Cancelled
+                            if (cancelled || DownloadEngineFlag.cancelled) {
+                                checkpoint(force = true)
+                                throw DownloadException.Cancelled
+                            }
+                            checkpoint()
                             repairJobs.removeAll { it.isCompleted }
 
                             val coveredNow = ledger.coveredBytes
@@ -821,11 +1044,28 @@ class DownloadEngine {
                 }
 
                 if (!ledger.isComplete() || written.get() != total) {
+                    // 保留半成品与账本：下次续传只补缺口，比整个重下省得多
+                    checkpoint(force = true)
                     throw DownloadException.IncompleteDetailed(ledger.describe())
                 }
                 runCatching { output.fd.sync() }
             } finally {
                 runCatching { output.close() }
+            }
+
+            // 校验通过：半成品原子地挪到成品目录，并清掉续传记录
+            if (resume != null) {
+                checkpoint(force = true)
+                runCatching { outFile.delete() }
+                val moved = resume.partFile.renameTo(outFile)
+                if (!moved) {
+                    // 跨文件系统（filesDir → 外部 filesDir）时 renameTo 会失败，退回复制
+                    runCatching {
+                        resume.partFile.copyTo(outFile, overwrite = true)
+                        resume.partFile.delete()
+                    }
+                }
+                ResumeStore.discard(resume.key)
             }
 
             accumulator.finish(total)
@@ -851,236 +1091,84 @@ class DownloadEngine {
     private suspend fun downloadSingle(
         url: String,
         outFile: File,
-        lanes: Int,
+        expectedTotal: Long,
         progress: (DownloadProgress) -> Unit,
-    ): SingleOutcome {
-        val client = OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(120, TimeUnit.SECONDS)
-            .callTimeout(0, TimeUnit.MILLISECONDS)
-            .followRedirects(true)
+    ): SingleOutcome = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", GitHubClient.USER_AGENT)
             .build()
-        synchronized(clients) { clients.add(client) }
-        allClients.add(client)
-
+        val call = bootstrapClient.newCall(request)
+        inflight.register(call)
         try {
-            // 先带 Range 试一小段：能拿到 206 就说明可以分段
-            val rangeProbe = Request.Builder()
-                .url(url)
-                .header("Range", "bytes=0-${SINGLE_PROBE_BYTES - 1}")
-                .header("User-Agent", GitHubClient.USER_AGENT)
-                .build()
+            call.execute().use { response ->
+                if (!response.isSuccessful) throw DownloadException.BadResponse
+                val body = response.body ?: throw DownloadException.BadResponse
+                val total = body.contentLength().takeIf { it > 0 } ?: expectedTotal
 
-            val ranged = withContext(Dispatchers.IO) {
-                val call = client.newCall(rangeProbe)
-                inflight.register(call)
-                try {
-                    call.execute().use { it.code == 206 }
-                } finally {
-                    inflight.release(call)
-                }
-            }
+                outFile.parentFile?.mkdirs()
+                outFile.delete()
+                var done = 0L
+                var lastEmit = 0L
+                var lastAt = System.nanoTime()
+                var lastBytes = 0L
+                var smoothed = 0.0
 
-            currentCoroutineContext().ensureActive()
-            if (DownloadEngineFlag.cancelled) throw DownloadException.Cancelled
+                body.byteStream().use { input ->
+                    outFile.outputStream().buffered(BUFFER_SIZE).use { sink ->
+                        val buffer = ByteArray(BUFFER_SIZE)
+                        while (true) {
+                            // 单连接路径同样要能秒停：标志位 + Call.cancel() 双保险
+                            if (cancelled || DownloadEngineFlag.cancelled) {
+                                throw DownloadException.Cancelled
+                            }
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            sink.write(buffer, 0, read)
+                            done += read
 
-            if (ranged) {
-                val total = probeSize(listOf(url))?.total
-                if (total != null && total >= MIN_CHUNKED_TOTAL) {
-                    // 升级：交给分段引擎跑，用独立临时目录避免和外层冲突
-                    val upgradeDir = File(outFile.parentFile ?: outFile.absoluteFile.parentFile, "u-${System.nanoTime()}")
-                    upgradeDir.mkdirs()
-                    try {
-                        val file = segmentDownload(
-                            urls = listOf(url),
-                            total = total,
-                            outFile = outFile,
-                            tempDir = upgradeDir,
-                            lanes = lanes,
-                            plan = listOf(ScoredRoute(com.artifactboost.app.data.DownloadRoute.DIRECT, 1.0)),
-                            progress = progress,
-                        )
-                        return SingleOutcome(file, total, lanes)
-                    } finally {
-                        upgradeDir.deleteRecursively()
-                    }
-                }
-            }
-
-            val request = Request.Builder()
-                .url(url)
-                .header("User-Agent", GitHubClient.USER_AGENT)
-                .build()
-
-            val written = withContext(Dispatchers.IO) {
-                val call = client.newCall(request)
-                inflight.register(call)
-                try {
-                    call.execute().use { response ->
-                        if (!response.isSuccessful) throw DownloadException.BadResponse
-                        val body = response.body ?: throw DownloadException.BadResponse
-                        val total = body.contentLength().takeIf { it > 0 } ?: 0L
-
-                        outFile.delete()
-                        var done = 0L
-                        val startedAt = System.nanoTime()
-                        var lastEmit = 0L
-
-                        body.byteStream().use { input ->
-                            outFile.outputStream().buffered(BUFFER_SIZE).use { sink ->
-                                val buffer = ByteArray(BUFFER_SIZE)
-                                while (true) {
-                                    // 单连接路径同样要能秒停：标志位 + Call.cancel() 双保险
-                                    if (cancelled || DownloadEngineFlag.cancelled) {
-                                        throw DownloadException.Cancelled
-                                    }
-                                    val read = input.read(buffer)
-                                    if (read <= 0) break
-                                    sink.write(buffer, 0, read)
-                                    done += read
-
-                                    val now = System.currentTimeMillis()
-                                    if (now - lastEmit >= PROGRESS_INTERVAL_MS) {
-                                        lastEmit = now
-                                        val elapsed = maxOf((System.nanoTime() - startedAt) / 1_000_000_000.0, 0.05)
-                                        progress(
-                                            DownloadProgress(
-                                                downloadedBytes = done,
-                                                totalBytes = total,
-                                                fraction = if (total > 0) (done.toFloat() / total) else 0f,
-                                                speedBytesPerSecond = done / elapsed,
-                                            ),
-                                        )
-                                    }
-                                }
+                            val now = System.nanoTime()
+                            val dt = (now - lastAt) / 1_000_000_000.0
+                            if (dt > 0.2) {
+                                val delta = done - lastBytes
+                                val instant = if (delta > 0) delta / dt else 0.0
+                                smoothed = if (smoothed <= 0) instant else smoothed * 0.6 + instant * 0.4
+                                lastBytes = done
+                                lastAt = now
+                            }
+                            if (now - lastEmit >= PROGRESS_INTERVAL_MS * 1_000_000L) {
+                                lastEmit = now
+                                val fraction = if (total > 0) (done.toFloat() / total) else 0f
+                                val eta = if (smoothed > 64 && total > done) (total - done) / smoothed else 0.0
+                                progress(
+                                    DownloadProgress(
+                                        downloadedBytes = done,
+                                        totalBytes = total,
+                                        fraction = fraction.coerceIn(0f, 1f),
+                                        speedBytesPerSecond = maxOf(smoothed, 0.0),
+                                        etaSeconds = eta,
+                                    ),
+                                )
                             }
                         }
-
-                        // **关键校验**：单连接路径以前从不检查「到底下完了没有」——
-                        // 连接中途断流时 read 会返回 -1，循环安静退出，文件被截断，
-                        // 却照样报告「下载完成」。解压时才发现文件不完整。
-                        // 这里必须比对声明的 Content-Length。
-                        if (total > 0 && done != total) {
-                            throw DownloadException.IncompleteDetailed(
-                                "单连接下载被截断：只收到 $done / $total 字节",
-                            )
-                        }
-                        if (done == 0L) throw DownloadException.Incomplete
-
-                        progress(
-                            DownloadProgress(
-                                downloadedBytes = done,
-                                totalBytes = maxOf(total, done),
-                                fraction = 1f,
-                                speedBytesPerSecond = 0.0,
-                            ),
-                        )
-                        done
                     }
-                } finally {
-                    inflight.release(call)
                 }
+
+                // **关键校验**：断流时 read 返回 -1、循环安静退出，文件被截断，
+                // 却照样报告「下载完成」。必须比对声明的 Content-Length。
+                if (total > 0 && done != total) {
+                    runCatching { outFile.delete() }
+                    throw DownloadException.IncompleteDetailed("单连接下载被截断：只收到 $done / $total 字节")
+                }
+                if (done == 0L) throw DownloadException.Incomplete
+                SingleOutcome(outFile, done, 1)
             }
-            return SingleOutcome(outFile, written, 1)
         } finally {
-            synchronized(clients) { clients.remove(client) }
-            allClients.remove(client)
-            client.dispatcher.cancelAll()
-            client.connectionPool.evictAll()
+            inflight.release(call)
         }
     }
 
     private data class SingleOutcome(val file: File, val bytes: Long, val lanes: Int)
-
-    // MARK: - 探测
-
-    private data class Probe(val total: Long, val chunked: Boolean)
-
-    /**
-     * 探测文件大小：优先用 `Range: bytes=0-0`（返回 206 + Content-Range 才确认支持分段），
-     * 失败再退回 HEAD。**并发**打所有通道，谁先给出确定答案就用谁的 ——
-     * 老实现是逐条串行，第一条是死镜像时就得白等 15s 超时，这正是「开始下载慢」的一段。
-     */
-    private suspend fun probeSize(urls: List<String>): Probe? {
-        if (urls.isEmpty()) return null
-
-        val results = coroutineScope {
-            urls.map { url ->
-                async(Dispatchers.IO) { url to probeSize(url) }
-            }.awaitAll()
-        }
-
-        // 优先：确认支持分段的（chunked == true 且体积已知），取原顺序里最靠前的
-        results.firstOrNull { (_, probe) -> probe != null && probe.chunked && probe.total > 0 }
-            ?.let { return it.second }
-
-        // 兜底：有体积但没确认分段（HEAD 探到的）
-        return results.firstNotNullOfOrNull { (_, probe) -> probe?.takeIf { it.total > 0 } }
-    }
-
-    private suspend fun probeSize(url: String): Probe? {
-        // 探测用的是全局共享的短超时客户端（probeClient），必须排除在
-        // clients/allClients 的登记之外 —— 否则并发探测时，
-        // 先跑完的那条会把共享客户端从登记表里移除，
-        // 后跑完的再移除一次，甚至在 cancel()/收尾时把别人的连接掐掉。
-        val client = probeClient
-
-        try {
-            val rangeRequest = Request.Builder()
-                .url(url)
-                .header("Range", "bytes=0-0")
-                .header("User-Agent", GitHubClient.USER_AGENT)
-                .build()
-            val probed = withContext(Dispatchers.IO) {
-                val call = client.newCall(rangeRequest)
-                inflight.register(call)
-                try {
-                    call.execute().use { response ->
-                        if (response.code == 206) {
-                            val contentRange = response.header("Content-Range")
-                            val total = contentRange?.substringAfterLast('/')?.trim()?.toLongOrNull()
-                            if (total != null && total > 0) return@use Probe(total, true)
-                        }
-                        // 返回 200 说明服务器忽略了 Range，不能分段
-                        if (response.code == 200) {
-                            val length = response.header("Content-Length")?.toLongOrNull() ?: 0L
-                            return@use Probe(length, false)
-                        }
-                        null
-                    }
-                } finally {
-                    inflight.release(call)
-                }
-            }
-            if (probed != null) return probed
-
-            val headRequest = Request.Builder()
-                .url(url)
-                .head()
-                .header("User-Agent", GitHubClient.USER_AGENT)
-                .build()
-            return withContext(Dispatchers.IO) {
-                val call = client.newCall(headRequest)
-                inflight.register(call)
-                try {
-                    call.execute().use { response ->
-                        if (response.isSuccessful) {
-                            val length = response.header("Content-Length")?.toLongOrNull()
-                            if (length != null && length > 0) Probe(length, false) else null
-                        } else {
-                            null
-                        }
-                    }
-                } finally {
-                    inflight.release(call)
-                }
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            return null
-        }
-    }
 
     private fun isCancellation(error: Throwable): Boolean =
         cancelled || error is DownloadException.Cancelled ||
@@ -1091,6 +1179,9 @@ class DownloadEngine {
         const val BUFFER_SIZE = 1 shl 16          // 64 KB
         const val MAX_ATTEMPTS = 3
         const val PROGRESS_INTERVAL_MS = 250L
+
+        /** 起步请求一次拿多少字节：够判断分段能力、够让进度条立刻动起来 */
+        const val BOOTSTRAP_BYTES = 256 * 1024
 
         /**
          * 单连接模式判断「能否升级为分段」时试探的字节数
@@ -1823,7 +1914,14 @@ internal object DownloadEngineFlag {
  * 退避时间，在到点之前对 [take] / [splitTail] 都不可见，
  * 调度器自然会去干别的活儿。
  */
-internal class SlicePool(val total: Long, slices: Int = 1) {
+internal class SlicePool(
+    val total: Long,
+    slices: Int = 1,
+    /** 断点续传时直接指定「要下的缺口」；不传就是从 0 到末尾的整段 */
+    gaps: List<LongRange>? = null,
+    /** 断点续传时已经下好的字节数，计入总进度 */
+    initialCompleted: Long = 0L,
+) {
 
     /** 池内条目：区间 + 可被取走的时间（退避用，0 表示立刻可取） */
     private data class Entry(val chunk: Chunk, val notBefore: Long = 0L)
@@ -1849,24 +1947,31 @@ internal class SlicePool(val total: Long, slices: Int = 1) {
     }
 
     init {
-        // 预切分：首轮就能派满 lanes 条连接，避免单区间导致的调度饿死（与 iOS 同步）。
-        // 按 lanes*4 均分，尾块吃余数；块太小（<64KB）时自动收敛，避免任务爆炸。
-        // 默认 slices=1 保持旧单测兼容。
-        val target = maxOf(1, slices)
-        if (target <= 1 || total <= 0) {
-            queue.add(Entry(Chunk(0, 0L, total - 1)))
+        completed.set(initialCompleted)
+        if (gaps != null) {
+            // 断点续传：池子里只放「还缺的区间」，已下好的直接算完成
+            gaps.filter { it.first >= 0 && it.last < total && it.first <= it.last }
+                .forEach { queue.add(Entry(Chunk(0, it.first, it.last))) }
         } else {
-            val maxSlices = maxOf(1, (total / (64 * 1024)).toInt())
-            val count = maxOf(1, minOf(target, maxSlices))
-            if (count <= 1) {
+            // 预切分：首轮就能派满 lanes 条连接，避免单区间导致的调度饿死（与 iOS 同步）。
+            // 按 lanes*4 均分，尾块吃余数；块太小（<64KB）时自动收敛，避免任务爆炸。
+            // 默认 slices=1 保持旧单测兼容。
+            val target = maxOf(1, slices)
+            if (target <= 1 || total <= 0) {
                 queue.add(Entry(Chunk(0, 0L, total - 1)))
             } else {
-                val base = total / count
-                var start = 0L
-                for (i in 0 until count) {
-                    val end = if (i == count - 1) total - 1 else start + base - 1
-                    queue.add(Entry(Chunk(0, start, end)))
-                    start = end + 1
+                val maxSlices = maxOf(1, (total / (64 * 1024)).toInt())
+                val count = maxOf(1, minOf(target, maxSlices))
+                if (count <= 1) {
+                    queue.add(Entry(Chunk(0, 0L, total - 1)))
+                } else {
+                    val base = total / count
+                    var start = 0L
+                    for (i in 0 until count) {
+                        val end = if (i == count - 1) total - 1 else start + base - 1
+                        queue.add(Entry(Chunk(0, start, end)))
+                        start = end + 1
+                    }
                 }
             }
         }
@@ -2004,11 +2109,15 @@ class ProgressAccumulator(
     private val handler: (DownloadProgress) -> Unit,
     /** 快照来源：每拍现取一次车道看板，拿到的就是「此刻」而不是「启动时」的明细 */
     private val diagnostics: (() -> DownloadDiagnostics?)? = null,
+    /** 续传时已经下好的字节：进度起点 */
+    initial: Long = 0L,
+    /** 续传跳过的字节数：界面据此显示「已续传 X」 */
+    private val resumedBytes: Long = 0L,
 ) {
-    @Volatile private var downloaded = 0L
+    @Volatile private var downloaded = initial
     @Volatile private var lastEmit = 0L
     @Volatile private var lastSampleTime = System.nanoTime()
-    @Volatile private var lastSampleBytes = 0L
+    @Volatile private var lastSampleBytes = initial
     @Volatile private var smoothedSpeed = 0.0
     @Volatile private var zeroStreak = 0
 
@@ -2033,6 +2142,7 @@ class ProgressAccumulator(
                 totalBytes = finalTotal,
                 fraction = 1f,
                 speedBytesPerSecond = maxOf(smoothedSpeed, 0.0),
+                resumedBytes = resumedBytes,
             ),
         )
     }
@@ -2054,11 +2164,15 @@ class ProgressAccumulator(
             lastSampleTime = now
             lastSampleBytes = current
         }
+        val remaining = maxOf(total - current, 0L)
+        val eta = if (smoothedSpeed > 64) remaining / smoothedSpeed else 0.0
         return DownloadProgress(
             downloadedBytes = current,
             totalBytes = total,
             fraction = if (total > 0) minOf(current.toFloat() / total, 1f) else 0f,
             speedBytesPerSecond = maxOf(smoothedSpeed, 0.0),
+            etaSeconds = eta,
+            resumedBytes = resumedBytes,
             diagnostics = diagnostics?.invoke(),
         )
     }
