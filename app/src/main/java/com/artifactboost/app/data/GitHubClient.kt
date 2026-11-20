@@ -214,10 +214,12 @@ class GitHubClient(val token: String) {
      * - 源码包：走 codeload.github.com，GitHub 现场打包同样支持直连；
      * - 构建产物 / 日志：必须走 api.github.com（要 Token 才给签名地址）。
      */
-    fun startUrl(source: DownloadSource): DownloadStart = when (source) {
+    fun startUrl(source: DownloadSource, isPrivate: Boolean = false): DownloadStart = when (source) {
         is DownloadSource.ReleaseAsset -> {
             val browser = source.browserUrl
-            if (!browser.isNullOrBlank()) {
+            // 公开仓库直接用 github.com 稳定地址（不碰 api.github.com）；
+            // 私有仓库走 API 端点，Token 鉴权是官方文档保证的路径，最稳。
+            if (!isPrivate && !browser.isNullOrBlank()) {
                 DownloadStart(browser)
             } else {
                 DownloadStart(
