@@ -96,8 +96,11 @@ fun SettingsScreen() {
         if (updated.mode != settings.mode || updated.customPrefix != settings.customPrefix) {
             com.artifactboost.app.download.RouteProbeCache.invalidateAll()
         }
+        val queueChanged = updated.maxConcurrent != settings.maxConcurrent
         settings = updated
         updated.save(context)
+        // 调大「同时下载数」后立刻把排队中的任务补进来，不用等现有任务结束
+        if (queueChanged) ArtifactBoostApp.instance.downloads.fillQueueSlots()
     }
 
     Scaffold(

@@ -495,7 +495,14 @@ class DownloadEngine {
             if (boot?.chunked != true || total < MIN_CHUNKED_TOTAL) {
                 // 不支持分段 / 体积太小 / 探测不到体积：单连接（但依然带真实进度）
                 request.resumeKey?.let { ResumeStore.discard(it) }
-                val single = downloadSingle(finalUrl, outFile, total, progress)
+                val single = downloadSingle(
+                    finalUrl,
+                    request.authToken,
+                    request.startHeaders,
+                    outFile,
+                    total,
+                    progress,
+                )
                 val elapsed = maxOf((System.nanoTime() - startedAt) / 1_000_000_000.0, 0.05)
                 return@withContext DownloadResult(single.file, single.bytes / elapsed, 1)
             }
@@ -1096,15 +1103,21 @@ class DownloadEngine {
      */
     private suspend fun downloadSingle(
         url: String,
+        authToken: String?,
+        headers: Map<String, String>,
         outFile: File,
         expectedTotal: Long,
         progress: (DownloadProgress) -> Unit,
     ): SingleOutcome = withContext(Dispatchers.IO) {
-        val request = Request.Builder()
+        val builder = Request.Builder()
             .url(url)
             .header("User-Agent", GitHubClient.USER_AGENT)
-            .build()
-        val call = bootstrapClient.newCall(request)
+        headers.forEach { (key, value) -> builder.header(key, value) }
+        // 私有仓库的源码包（codeload）同样要鉴权；Token 只发给 GitHub 自己的域名
+        if (!authToken.isNullOrBlank() && isGitHubHost(url)) {
+            builder.header("Authorization", "Bearer $authToken")
+        }
+        val call = bootstrapClient.newCall(builder.build())
         inflight.register(call)
         try {
             call.execute().use { response ->

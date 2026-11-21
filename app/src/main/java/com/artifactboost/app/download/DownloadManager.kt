@@ -262,6 +262,19 @@ class DownloadManager(
         pending.removeAll { it.first.id == id }
     }
 
+    /**
+     * 用户把「同时下载数」调大后，立刻把空出来的名额补满。
+     * 否则要等某个正在下载的任务结束，队列才会动 —— 看起来像设置没生效。
+     */
+    fun fillQueueSlots() {
+        val limit = AccelerationSettings.load(appContext).clampedMaxConcurrent
+        while (activeCount < limit) {
+            val before = activeCount
+            drainQueue()
+            if (activeCount == before) return
+        }
+    }
+
     fun cancel(item: DownloadItem) {
         engines[item.id]?.cancel()
         jobs[item.id]?.cancel()
