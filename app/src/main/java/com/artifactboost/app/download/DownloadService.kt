@@ -46,7 +46,7 @@ class DownloadService : Service() {
                 while (true) {
                     val states = manager.states.value
                     val active = states.values.filterIsInstance<DownloadState.Downloading>()
-                    if (active.isEmpty() && manager.activeCount == 0) {
+                    if (active.isEmpty() && manager.activeCount == 0 && manager.queuedCount == 0) {
                         // 没有活跃任务了就撤下通知
                         stopSelf()
                         break

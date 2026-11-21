@@ -201,6 +201,9 @@ class DownloadManager(
     private fun drainQueue() {
         val next = pending.firstOrNull { state(it.first) is DownloadState.Queued } ?: return
         pending.remove(next)
+        // 队列里补位时前台服务可能已经停了（上一个任务刚结束），重新拉起，
+        // 否则补位的下载会在没有前台服务的情况下跑，容易被系统回收。
+        runCatching { DownloadService.start(appContext) }
         // start 会把状态推到 Resolving；先复位，免得被自己的 Queued 守卫挡回来
         _states.value = _states.value + (next.first.id to DownloadState.Idle)
         start(next.first, next.second)
