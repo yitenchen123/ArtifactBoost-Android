@@ -422,6 +422,7 @@ class DownloadManager(
             connections = settings.clampedConnections,
             allowChunking = item.source.supportsChunkedDownload,
             resumeKey = item.id,
+            expectedSize = item.size,
         )
     }
 

@@ -182,6 +182,8 @@ data class DownloadRequest(
     val allowChunking: Boolean = true,
     /** 断点续传的键（下载项 id） */
     val resumeKey: String? = null,
+    /** 已知的文件体积（列表接口给的）：小文件直接单连接，省掉起步请求的 256KB 重复下载 */
+    val expectedSize: Long? = null,
 )
 
 /** 已覆盖区间的补集：续传时真正要下的那些缺口 */
@@ -475,7 +477,11 @@ class DownloadEngine {
             )
 
             // ---- 起步：一个请求同时完成「解析 / 探体积 / 拿首块」----
-            val boot = if (request.allowChunking) {
+            // 已知是小文件就不起步了：单连接本来就要整个下一遍，
+            // 再先拉 256KB 起步块等于白下一截（小文件占比不低，比如构建日志）。
+            val boot = if (request.allowChunking &&
+                (request.expectedSize ?: Long.MAX_VALUE) >= MIN_CHUNKED_TOTAL
+            ) {
                 fetchBootstrap(request.startUrl, request.authToken, request.startHeaders)
             } else {
                 null
@@ -490,7 +496,7 @@ class DownloadEngine {
                 }
             }
             val finalUrl = boot?.finalUrl ?: request.startUrl
-            val total = boot?.total ?: 0L
+            val total = boot?.total ?: (request.expectedSize ?: 0L)
 
             if (boot?.chunked != true || total < MIN_CHUNKED_TOTAL) {
                 // 不支持分段 / 体积太小 / 探测不到体积：单连接（但依然带真实进度）
