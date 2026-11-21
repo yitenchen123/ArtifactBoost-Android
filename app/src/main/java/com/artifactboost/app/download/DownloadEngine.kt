@@ -140,6 +140,10 @@ sealed class DownloadException(message: String) : IOException(message) {
     /** 服务器明确要求我们慢一点（429 / 503 等），需要按 Retry-After 退避 */
     class Throttled(val code: Int, val retryAfterMillis: Long?) :
         DownloadException("下载失败：服务器限流（$code）")
+
+    /** 长度对得上但内容结构不对：压缩包损坏 / 截断 */
+    class VerificationFailed(reason: String) :
+        DownloadException("文件校验失败：$reason，已自动重试")
 }
 
 data class DownloadResult(
@@ -491,7 +495,14 @@ class DownloadEngine {
             if (boot?.chunked != true || total < MIN_CHUNKED_TOTAL) {
                 // 不支持分段 / 体积太小 / 探测不到体积：单连接（但依然带真实进度）
                 request.resumeKey?.let { ResumeStore.discard(it) }
-                val single = downloadSingle(finalUrl, outFile, total, progress)
+                val single = downloadSingle(
+                    finalUrl,
+                    request.authToken,
+                    request.startHeaders,
+                    outFile,
+                    total,
+                    progress,
+                )
                 val elapsed = maxOf((System.nanoTime() - startedAt) / 1_000_000_000.0, 0.05)
                 return@withContext DownloadResult(single.file, single.bytes / elapsed, 1)
             }
@@ -1092,15 +1103,21 @@ class DownloadEngine {
      */
     private suspend fun downloadSingle(
         url: String,
+        authToken: String?,
+        headers: Map<String, String>,
         outFile: File,
         expectedTotal: Long,
         progress: (DownloadProgress) -> Unit,
     ): SingleOutcome = withContext(Dispatchers.IO) {
-        val request = Request.Builder()
+        val builder = Request.Builder()
             .url(url)
             .header("User-Agent", GitHubClient.USER_AGENT)
-            .build()
-        val call = bootstrapClient.newCall(request)
+        headers.forEach { (key, value) -> builder.header(key, value) }
+        // 私有仓库的源码包（codeload）同样要鉴权；Token 只发给 GitHub 自己的域名
+        if (!authToken.isNullOrBlank() && isGitHubHost(url)) {
+            builder.header("Authorization", "Bearer $authToken")
+        }
+        val call = bootstrapClient.newCall(builder.build())
         inflight.register(call)
         try {
             call.execute().use { response ->

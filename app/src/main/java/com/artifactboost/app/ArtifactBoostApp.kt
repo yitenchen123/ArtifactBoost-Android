@@ -32,7 +32,9 @@ class ArtifactBoostApp : Application() {
         // 之前是在 SessionManager.init 里同步读，是二次启动首屏卡住的元凶。
         appScope.launch {
             session.restore()
-            // 恢复出登录态后再补拉一次用户信息
+            // 上次进程被杀时没下完的任务，登录态就绪后立刻续上
+            downloads.restorePending()
+            // 再补拉一次用户信息（网络慢不该耽误续下）
             session.refreshUser()
         }
 

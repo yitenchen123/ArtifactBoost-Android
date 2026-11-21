@@ -195,7 +195,17 @@ GitHub Actions 产物加速下载器。**多线程 + HTTP Range 分段并发 + �
 - 半成品写在外置私有目录 `partial/<key>.part`，覆盖区间账本 `partial/<key>.json` 每 1.5 秒落盘；
 - 进程被杀、切后台被回收、用户点暂停，下次都只补**没下过的那几段**（最多重下 1.5 秒的量）；
 - 续传前用「文件体积 + ETag / Last-Modified」三重校验，发现源文件变了就整段重下，绝不拼错文件；
-- 暂停保留半成品；取消才连半成品一起清掉。
+- 暂停保留半成品；取消才连半成品一起清掉；
+- 未完成任务同时落盘到 `filesDir/pending-downloads.json`，**进程被杀后下次启动自动续下**；
+  完成 / 失败 / 取消 / 移除都会删记录，不会「复活」已完成的任务。
+
+## 下载队列与完整性校验
+
+- 设置里可调「同时下载数」（1 / 2 / 3 / 5）。超出上限的任务显示「排队中」，
+  前面的完成 / 取消 / 暂停后自动补位；调大上限时排队任务立刻开跑；
+- 下载完成的压缩包会做一次 CRC 校验：ZIP 逐条目核对 size + CRC32，tar.gz 走 GZIPInputStream
+  读到流末尾（会校验 CRC/ISIZE）。坏包当场删除并自动重试一次，不会留到解压时才发现；
+- 校验期间状态显示「正在校验完整性」，通知栏也会同步提示 —— 大压缩包解一遍要几秒，不会像卡住。
 
 ## 项目结构
 
@@ -215,7 +225,10 @@ app/src/main/java/com/artifactboost/app/
 │  ├─ AdaptiveLimiter.kt      # ★ AIMD 自适应并发窗口 + 速率闸
 │  ├─ RouteProbe.kt           # ★ 通道并发探测 + 5 分钟缓存
 │  ├─ MemoryBudget.kt         # ★ 按可用堆约束并发（大文件防 OOM）
-│  ├─ DownloadManager.kt      # 任务调度 / 通道选择 / 重试
+│  ├─ DownloadManager.kt      # 任务调度 / 队列 / 通道选择 / 重试
+│  ├─ DownloadTaskStore.kt    # 未完成任务落盘（启动自动续下）
+│  ├─ ResumeStore.kt          # 断点续传元数据
+│  ├─ ArtifactVerifier.kt     # 完成后 CRC / 结构校验
 │  └─ DownloadService.kt      # 前台服务 + 通知进度
 ├─ ui/
 │  ├─ theme/Theme.kt          # GitHub Primer 配色（浅色/深色）

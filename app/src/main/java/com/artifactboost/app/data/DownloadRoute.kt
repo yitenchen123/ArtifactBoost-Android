@@ -101,8 +101,11 @@ data class AccelerationSettings(
     val connections: Int = 16,
     val mode: RouteMode = RouteMode.SMART,
     val customPrefix: String = "",
+    /** 同时进行的下载数（IDM 的下载队列）：超过就排队，前面的完成自动补位 */
+    val maxConcurrent: Int = 3,
 ) {
     val clampedConnections: Int get() = connections.coerceIn(1, MAX_CONNECTIONS)
+    val clampedMaxConcurrent: Int get() = maxConcurrent.coerceIn(1, MAX_CONCURRENT_LIMIT)
 
     /**
      * 当前设置下的候选通道（直连永远保留兜底）。
@@ -133,6 +136,7 @@ data class AccelerationSettings(
             .putInt(KEY_CONNECTIONS, clampedConnections)
             .putString(KEY_MODE, mode.name)
             .putString(KEY_CUSTOM_PREFIX, customPrefix)
+            .putInt(KEY_MAX_CONCURRENT, clampedMaxConcurrent)
             .apply()
     }
 
@@ -144,10 +148,15 @@ data class AccelerationSettings(
         /** 设置页档位 */
         val CONNECTION_OPTIONS = listOf(8, 16, 32, 64, 128)
 
+        /** 同时下载数档位 */
+        val CONCURRENT_OPTIONS = listOf(1, 2, 3, 5)
+        const val MAX_CONCURRENT_LIMIT = 5
+
         private const val PREFS_NAME = "artifactboost_settings"
         private const val KEY_CONNECTIONS = "ab.connections"
         private const val KEY_MODE = "ab.routeMode"
         private const val KEY_CUSTOM_PREFIX = "ab.customPrefix"
+        private const val KEY_MAX_CONCURRENT = "ab.maxConcurrent"
 
         private fun prefs(context: Context): SharedPreferences =
             context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -163,6 +172,7 @@ data class AccelerationSettings(
                 connections = if (storedConnections > 0) storedConnections else 16,
                 mode = mode,
                 customPrefix = store.getString(KEY_CUSTOM_PREFIX, "").orEmpty(),
+                maxConcurrent = store.getInt(KEY_MAX_CONCURRENT, 0).takeIf { it > 0 } ?: 3,
             )
         }
     }

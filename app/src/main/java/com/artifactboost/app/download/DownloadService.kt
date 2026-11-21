@@ -46,16 +46,19 @@ class DownloadService : Service() {
                 while (true) {
                     val states = manager.states.value
                     val active = states.values.filterIsInstance<DownloadState.Downloading>()
-                    if (active.isEmpty() && manager.activeCount == 0) {
+                    if (active.isEmpty() && manager.activeCount == 0 && manager.queuedCount == 0) {
                         // 没有活跃任务了就撤下通知
                         stopSelf()
                         break
                     }
+                    val verifying = active.isEmpty() &&
+                        states.values.any { it is DownloadState.Verifying }
                     val progress = active.firstOrNull()?.progress
                     notify(
                         active.size,
                         progress?.fraction?.times(100)?.toInt() ?: 0,
                         progress?.speedBytesPerSecond ?: 0.0,
+                        verifying,
                     )
                     delay(1000)
                 }
@@ -64,22 +67,30 @@ class DownloadService : Service() {
         return START_STICKY
     }
 
-    private fun notify(count: Int, percent: Int, speed: Double) {
+    private fun notify(count: Int, percent: Int, speed: Double, verifying: Boolean = false) {
         val manager = getSystemService(NotificationManager::class.java) ?: return
-        manager.notify(NOTIFICATION_ID, buildNotification(count, percent, speed))
+        manager.notify(NOTIFICATION_ID, buildNotification(count, percent, speed, verifying))
     }
 
-    private fun buildNotification(count: Int, percent: Int, speed: Double = 0.0) =
+    private fun buildNotification(
+        count: Int,
+        percent: Int,
+        speed: Double = 0.0,
+        verifying: Boolean = false,
+    ) =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("ArtifactBoost 正在下载")
             .setContentText(
-                if (count <= 1) "$percent% · ${com.artifactboost.app.util.formatSpeed(speed)}"
-                else "共 $count 个任务进行中",
+                when {
+                    verifying -> "字节已下完，正在校验完整性…"
+                    count <= 1 -> "$percent% · ${com.artifactboost.app.util.formatSpeed(speed)}"
+                    else -> "共 $count 个任务进行中"
+                },
             )
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setProgress(100, percent.coerceIn(0, 100), percent <= 0)
+            .setProgress(100, percent.coerceIn(0, 100), verifying || percent <= 0)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
 

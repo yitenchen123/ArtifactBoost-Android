@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.artifactboost.app.ArtifactBoostApp
 import com.artifactboost.app.data.DownloadItem
+import com.artifactboost.app.download.DownloadState
 import com.artifactboost.app.ui.components.CardSurface
 import com.artifactboost.app.ui.components.EmptyStateView
 import com.artifactboost.app.ui.components.MetricTile
@@ -70,6 +71,7 @@ fun DownloadsScreen() {
         it is com.artifactboost.app.download.DownloadState.Downloading ||
             it is com.artifactboost.app.download.DownloadState.Resolving
     }
+    val verifyingCount = states.values.count { it is DownloadState.Verifying }
 
     var menuOpen by remember { mutableStateOf(false) }
     var pendingRemove by remember { mutableStateOf<DownloadItem?>(null) }
@@ -125,8 +127,20 @@ fun DownloadsScreen() {
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        val queuedCount = states.values.count { it is DownloadState.Queued }
                         Text(
-                            if (activeCount > 0) "正在下载 $activeCount 个" else "全部下载",
+                            buildString {
+                                if (activeCount > 0) append("正在下载 $activeCount 个")
+                                if (verifyingCount > 0) {
+                                    if (isNotEmpty()) append(" · ")
+                                    append("$verifyingCount 个校验中")
+                                }
+                                if (queuedCount > 0) {
+                                    if (isNotEmpty()) append(" · ")
+                                    append("$queuedCount 个排队")
+                                }
+                                if (isEmpty()) append("全部下载")
+                            },
                             fontSize = 12.sp,
                             color = colors.muted,
                         )
@@ -217,7 +231,8 @@ private fun OverviewCard(
     val colors = AppTheme.colors
     val active = items.count {
         states[it.id] is com.artifactboost.app.download.DownloadState.Downloading ||
-            states[it.id] is com.artifactboost.app.download.DownloadState.Resolving
+            states[it.id] is com.artifactboost.app.download.DownloadState.Resolving ||
+            states[it.id] is com.artifactboost.app.download.DownloadState.Verifying
     }
     val finished = items.count { states[it.id] is com.artifactboost.app.download.DownloadState.Finished }
     val failed = items.count { states[it.id] is com.artifactboost.app.download.DownloadState.Failed }
