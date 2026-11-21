@@ -21,6 +21,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -162,7 +163,7 @@ class DownloadManager(
                 _order.value = listOf(item.id) + _order.value
             }
             _items.value = _items.value + (item.id to item)
-            _states.value = _states.value + (item.id to DownloadState.Queued)
+            _states.update { it + (item.id to DownloadState.Queued) }
             setRouteSummary(item.id, "排队中 · 等待前面的下载完成")
             persist(item, settings)
             if (pending.none { it.first.id == item.id }) {
@@ -175,7 +176,7 @@ class DownloadManager(
             _order.value = listOf(item.id) + _order.value
         }
         _items.value = _items.value + (item.id to item)
-        _states.value = _states.value + (item.id to DownloadState.Resolving)
+        _states.update { it + (item.id to DownloadState.Resolving) }
         _routeSummary.value = _routeSummary.value - item.id
         // 先落盘再开工：中途进程被杀，下次启动能按这份记录续下
         persist(item, settings)
@@ -203,10 +204,10 @@ class DownloadManager(
                         val saved = "已保存到 ${published.displayPath}"
                         setRouteSummary(item.id, if (prev.isNullOrBlank()) saved else "$prev · $saved")
                     }
-                    _states.value = _states.value + (
+                    _states.update { it + (
                         item.id to DownloadState.Finished(file, published?.uri, published?.displayPath)
-                        )
-                    _lastProgress.value = _lastProgress.value - item.id
+                        ) }
+                    _lastProgress.update { it - item.id }
                 }
                 forget(item.id)
             } catch (e: Exception) {
@@ -216,10 +217,10 @@ class DownloadManager(
                         // 取消有两种：用户点了暂停（状态已经是 Paused，别覆盖），
                         // 以及用户点了取消（回 Idle）
                         if (_states.value[item.id] !is DownloadState.Paused) {
-                            _states.value = _states.value + (item.id to DownloadState.Idle)
+                            _states.update { it + (item.id to DownloadState.Idle) }
                         }
                     } else {
-                        _states.value = _states.value + (item.id to DownloadState.Failed(e.message ?: "下载失败"))
+                        _states.update { it + (item.id to DownloadState.Failed(e.message ?: "下载失败")) }
                         _routeSummary.value = _routeSummary.value - item.id
                         // 失败不自动续下：清记录，用户手动重试时会重新落盘
                         forget(item.id)
@@ -241,7 +242,7 @@ class DownloadManager(
     /** 暂停：掐断连接但**保留**半成品与续传账本，点「继续」从断点接着下 */
     fun pause(item: DownloadItem) {
         val progress = _lastProgress.value[item.id] ?: DownloadProgress()
-        _states.value = _states.value + (item.id to DownloadState.Paused(progress))
+        _states.update { it + (item.id to DownloadState.Paused(progress)) }
         engines[item.id]?.cancel()
         jobs[item.id]?.cancel()
         jobs.remove(item.id)
@@ -260,7 +261,7 @@ class DownloadManager(
         // 否则补位的下载会在没有前台服务的情况下跑，容易被系统回收。
         runCatching { DownloadService.start(appContext) }
         // start 会把状态推到 Resolving；先复位，免得被自己的 Queued 守卫挡回来
-        _states.value = _states.value + (next.first.id to DownloadState.Idle)
+        _states.update { it + (next.first.id to DownloadState.Idle) }
         start(next.first, next.second)
     }
 
@@ -289,8 +290,8 @@ class DownloadManager(
         // 用户主动取消：连同半成品一起清掉，不恢复
         ResumeStore.discard(item.id)
         forget(item.id)
-        _lastProgress.value = _lastProgress.value - item.id
-        _states.value = _states.value + (item.id to DownloadState.Idle)
+        _lastProgress.update { it - item.id }
+        _states.update { it + (item.id to DownloadState.Idle) }
         removeFromQueue(item.id)
         drainQueue()
     }
@@ -302,8 +303,8 @@ class DownloadManager(
         jobs.remove(item.id)
         ResumeStore.discard(item.id)
         forget(item.id)
-        _lastProgress.value = _lastProgress.value - item.id
-        _states.value = _states.value - item.id
+        _lastProgress.update { it - item.id }
+        _states.update { it - item.id }
         _routeSummary.value = _routeSummary.value - item.id
         _items.value = _items.value - item.id
         _order.value = _order.value - item.id
@@ -356,7 +357,7 @@ class DownloadManager(
                 // 否则进度回调会因为「不是 Resolving/Downloading」被自己挡掉。
                 // 只在仍是 Verifying 时复位，避免把用户刚点的「暂停」覆盖掉。
                 if (_states.value[item.id] is DownloadState.Verifying) {
-                    _states.value = _states.value + (item.id to DownloadState.Resolving)
+                    _states.update { it + (item.id to DownloadState.Resolving) }
                 }
                 val result = engine.download(request, outputDir) progress@{ progress ->
                     // 只接受「本代任务」且仍在活动状态时的进度。
@@ -366,12 +367,12 @@ class DownloadManager(
                     if (current !is DownloadState.Resolving && current !is DownloadState.Downloading) {
                         return@progress
                     }
-                    _lastProgress.value = _lastProgress.value + (item.id to progress)
-                    _states.value = _states.value + (item.id to DownloadState.Downloading(progress))
+                    _lastProgress.update { it + (item.id to progress) }
+                    _states.update { it + (item.id to DownloadState.Downloading(progress)) }
                 }
                 // 长度对不代表内容对：压缩包再验一次结构/CRC，坏包当场重试。
                 // 大压缩包要解一遍算 CRC，明确亮出「校验中」，别让界面像卡住了。
-                _states.value = _states.value + (item.id to DownloadState.Verifying)
+                _states.update { it + (item.id to DownloadState.Verifying) }
                 val reason = withContext(Dispatchers.IO) { ArtifactVerifier.verify(result.file) }
                 if (reason != null) {
                     runCatching { result.file.delete() }
