@@ -196,28 +196,34 @@ class DownloadManager(
                 }
                 // 校验/发布期间用户可能已经取消：别再把它标成「完成」
                 coroutineContext.ensureActive()
-                if (published != null) {
-                    val prev = _routeSummary.value[item.id]
-                    val saved = "已保存到 ${published.displayPath}"
-                    setRouteSummary(item.id, if (prev.isNullOrBlank()) saved else "$prev · $saved")
+                // 用户也可能在下完的瞬间点「移除」：列表里已经没有这一项，别留下幽灵状态
+                if (_items.value[item.id] != null) {
+                    if (published != null) {
+                        val prev = _routeSummary.value[item.id]
+                        val saved = "已保存到 ${published.displayPath}"
+                        setRouteSummary(item.id, if (prev.isNullOrBlank()) saved else "$prev · $saved")
+                    }
+                    _states.value = _states.value + (
+                        item.id to DownloadState.Finished(file, published?.uri, published?.displayPath)
+                        )
+                    _lastProgress.value = _lastProgress.value - item.id
                 }
-                _states.value = _states.value + (
-                    item.id to DownloadState.Finished(file, published?.uri, published?.displayPath)
-                    )
-                _lastProgress.value = _lastProgress.value - item.id
                 forget(item.id)
             } catch (e: Exception) {
-                if (isCancellation(e)) {
-                    // 取消有两种：用户点了暂停（状态已经是 Paused，别覆盖），
-                    // 以及用户点了取消（回 Idle）
-                    if (_states.value[item.id] !is DownloadState.Paused) {
-                        _states.value = _states.value + (item.id to DownloadState.Idle)
+                // 任务已被移除时只做收尾，不再写状态
+                if (_items.value[item.id] != null) {
+                    if (isCancellation(e)) {
+                        // 取消有两种：用户点了暂停（状态已经是 Paused，别覆盖），
+                        // 以及用户点了取消（回 Idle）
+                        if (_states.value[item.id] !is DownloadState.Paused) {
+                            _states.value = _states.value + (item.id to DownloadState.Idle)
+                        }
+                    } else {
+                        _states.value = _states.value + (item.id to DownloadState.Failed(e.message ?: "下载失败"))
+                        _routeSummary.value = _routeSummary.value - item.id
+                        // 失败不自动续下：清记录，用户手动重试时会重新落盘
+                        forget(item.id)
                     }
-                } else {
-                    _states.value = _states.value + (item.id to DownloadState.Failed(e.message ?: "下载失败"))
-                    _routeSummary.value = _routeSummary.value - item.id
-                    // 失败不自动续下：清记录，用户手动重试时会重新落盘
-                    forget(item.id)
                 }
             } finally {
                 // 只有「还是这一代任务」才清理；否则会把用户刚点「继续」新建的那一代误删
@@ -416,6 +422,7 @@ class DownloadManager(
             connections = settings.clampedConnections,
             allowChunking = item.source.supportsChunkedDownload,
             resumeKey = item.id,
+            expectedSize = item.size,
         )
     }
 
