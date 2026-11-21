@@ -65,7 +65,8 @@ fun RootScreen() {
     val haptics = LocalHapticFeedback.current
     val activeCount = states.values.count {
         it is com.artifactboost.app.download.DownloadState.Downloading ||
-            it is com.artifactboost.app.download.DownloadState.Resolving
+            it is com.artifactboost.app.download.DownloadState.Resolving ||
+            it is com.artifactboost.app.download.DownloadState.Verifying
     }
 
     // 侧滑返回时，先回到「仓库」这个首页 Tab，再退出 App

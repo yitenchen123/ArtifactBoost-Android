@@ -225,6 +225,10 @@ fun DownloadItemRow(
                 QueuedSection(item = item)
             }
 
+            DownloadState.Verifying -> {
+                VerifyingSection()
+            }
+
             is DownloadState.Paused -> {
                 PausedSection(item = item, progress = state.progress)
             }
@@ -573,6 +577,26 @@ private fun QueuedSection(item: DownloadItem) {
             contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
         ) {
             Text("取消", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = colors.red)
+        }
+    }
+}
+
+/** 校验中：字节已下完，正在解压算 CRC（大文件要几秒），必须给用户反馈 */
+@Composable
+private fun VerifyingSection() {
+    val colors = AppTheme.colors
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(9.dp),
+    ) {
+        CircularProgressIndicator(
+            modifier = Modifier.size(16.dp),
+            color = colors.green,
+            strokeWidth = 2.dp,
+        )
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("正在校验完整性", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = colors.strongText)
+            Text("逐条目核对 CRC，确认压缩包没有损坏", fontSize = 10.sp, color = colors.subtle)
         }
     }
 }
