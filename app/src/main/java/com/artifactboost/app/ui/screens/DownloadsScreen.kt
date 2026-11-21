@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.artifactboost.app.ArtifactBoostApp
 import com.artifactboost.app.data.DownloadItem
+import com.artifactboost.app.download.DownloadState
 import com.artifactboost.app.ui.components.CardSurface
 import com.artifactboost.app.ui.components.EmptyStateView
 import com.artifactboost.app.ui.components.MetricTile
