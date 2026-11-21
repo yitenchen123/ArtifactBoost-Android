@@ -35,6 +35,9 @@ sealed class DownloadState {
 
     /** 用户主动暂停：半成品与续传账本都保留，点「继续」从断点接着下 */
     data class Paused(val progress: DownloadProgress) : DownloadState()
+
+    /** 达到「同时下载数」上限，排队等前面的完成 */
+    data object Queued : DownloadState()
     data class Finished(
         /** 私有暂存目录里的原始文件（引擎直写，多线程落盘用） */
         val file: File,
@@ -78,6 +81,9 @@ class DownloadManager(
     /** 每次 start 递增：暂停后立刻「继续」时，旧任务的收尾不能误删新一代的引擎/任务引用 */
     private val generations = mutableMapOf<String, Int>()
 
+    /** 下载队列：超过「同时下载数」的任务排在这里，前面的完成 / 取消 / 暂停后自动补位 */
+    private val pending = mutableListOf<Pair<DownloadItem, AccelerationSettings>>()
+
     /** 引擎落盘用的私有暂存目录；完成后会自动复制一份到系统公共下载目录 */
     val outputDir: File
         get() = File(appContext.getExternalFilesDir(null) ?: appContext.filesDir, "Artifacts")
@@ -92,6 +98,14 @@ class DownloadManager(
             it is DownloadState.Downloading || it is DownloadState.Resolving
         }
 
+    val queuedCount: Int
+        get() = _states.value.values.count { it is DownloadState.Queued }
+
+    init {
+        // 清掉 7 天都没动静的续传残留，避免半成品永久占着磁盘
+        ResumeStore.prune()
+    }
+
     val orderedItems: List<DownloadItem>
         get() = _order.value.mapNotNull { _items.value[it] }
 
@@ -100,8 +114,22 @@ class DownloadManager(
     fun start(item: DownloadItem, settings: AccelerationSettings) {
         val client = session.client.value ?: return
         when (state(item)) {
-            is DownloadState.Resolving, is DownloadState.Downloading -> return
+            is DownloadState.Resolving, is DownloadState.Downloading, is DownloadState.Queued -> return
             else -> Unit
+        }
+
+        // 达到「同时下载数」上限：排队，等前面的下完自动开始（IDM 的下载队列）
+        if (activeCount >= settings.clampedMaxConcurrent) {
+            if (_items.value[item.id] == null) {
+                _order.value = listOf(item.id) + _order.value
+            }
+            _items.value = _items.value + (item.id to item)
+            _states.value = _states.value + (item.id to DownloadState.Queued)
+            setRouteSummary(item.id, "排队中 · 等待前面的下载完成")
+            if (pending.none { it.first.id == item.id }) {
+                pending.add(item to settings)
+            }
+            return
         }
 
         if (_items.value[item.id] == null) {
@@ -150,6 +178,8 @@ class DownloadManager(
                     engines.remove(item.id)
                     jobs.remove(item.id)
                 }
+                // 让出一个名额：队列里的下一个自动开始
+                drainQueue()
             }
         }
     }
@@ -163,6 +193,21 @@ class DownloadManager(
         jobs.remove(item.id)
         engines.remove(item.id)
         _routeSummary.value = _routeSummary.value - item.id
+        removeFromQueue(item.id)
+        drainQueue()
+    }
+
+    /** 从队列里补一个任务进来（一次只补一个：每次调用都对应一个被让出的名额） */
+    private fun drainQueue() {
+        val next = pending.firstOrNull { state(it.first) is DownloadState.Queued } ?: return
+        pending.remove(next)
+        // start 会把状态推到 Resolving；先复位，免得被自己的 Queued 守卫挡回来
+        _states.value = _states.value + (next.first.id to DownloadState.Idle)
+        start(next.first, next.second)
+    }
+
+    private fun removeFromQueue(id: String) {
+        pending.removeAll { it.first.id == id }
     }
 
     fun cancel(item: DownloadItem) {
@@ -174,6 +219,8 @@ class DownloadManager(
         ResumeStore.discard(item.id)
         _lastProgress.value = _lastProgress.value - item.id
         _states.value = _states.value + (item.id to DownloadState.Idle)
+        removeFromQueue(item.id)
+        drainQueue()
     }
 
     fun remove(item: DownloadItem) {
@@ -187,6 +234,8 @@ class DownloadManager(
         _routeSummary.value = _routeSummary.value - item.id
         _items.value = _items.value - item.id
         _order.value = _order.value - item.id
+        removeFromQueue(item.id)
+        drainQueue()
     }
 
     fun clearFinished() {
@@ -232,6 +281,12 @@ class DownloadManager(
                 val result = engine.download(request, outputDir) { progress ->
                     _lastProgress.value = _lastProgress.value + (item.id to progress)
                     _states.value = _states.value + (item.id to DownloadState.Downloading(progress))
+                }
+                // 长度对不代表内容对：压缩包再验一次结构/CRC，坏包当场重试
+                val reason = withContext(Dispatchers.IO) { ArtifactVerifier.verify(result.file) }
+                if (reason != null) {
+                    runCatching { result.file.delete() }
+                    throw DownloadException.VerificationFailed(reason)
                 }
                 setRouteSummary(item.id, "${describe(request.routes)} · 平均 ${formatSpeed(result.averageSpeed)}")
                 _lastProgress.value = _lastProgress.value - item.id

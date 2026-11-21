@@ -260,6 +260,54 @@ fun SettingsScreen() {
                 }
             }
 
+            // MARK: - 下载队列
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    SettingsHeader("下载队列")
+                    CardSurface {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "同时下载数",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = colors.strongText,
+                                )
+                                Spacer(Modifier.weight(1f))
+                                Text(
+                                    "${settings.clampedMaxConcurrent} 个",
+                                    fontSize = 17.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                    color = colors.blue,
+                                )
+                            }
+                            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                                AccelerationSettings.CONCURRENT_OPTIONS.forEachIndexed { index, count ->
+                                    SegmentedButton(
+                                        selected = settings.maxConcurrent == count,
+                                        onClick = { persist(settings.copy(maxConcurrent = count)) },
+                                        shape = SegmentedButtonDefaults.itemShape(
+                                            index = index,
+                                            count = AccelerationSettings.CONCURRENT_OPTIONS.size,
+                                        ),
+                                    ) { Text("$count", fontSize = 13.sp) }
+                                }
+                            }
+                            Text(
+                                "超出的任务会显示「排队中」，前面的下载完成、取消或暂停后自动补位。"
+                                    + "多个大文件同时下会互相抢带宽，建议 2~3 个。设置会自动保存，下载时直接生效。",
+                                fontSize = 11.sp,
+                                color = colors.subtle,
+                            )
+                        }
+                    }
+                }
+            }
+
             // MARK: - 下载源
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {

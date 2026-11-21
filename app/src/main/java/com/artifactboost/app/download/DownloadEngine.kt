@@ -140,6 +140,10 @@ sealed class DownloadException(message: String) : IOException(message) {
     /** 服务器明确要求我们慢一点（429 / 503 等），需要按 Retry-After 退避 */
     class Throttled(val code: Int, val retryAfterMillis: Long?) :
         DownloadException("下载失败：服务器限流（$code）")
+
+    /** 长度对得上但内容结构不对：压缩包损坏 / 截断 */
+    class VerificationFailed(reason: String) :
+        DownloadException("文件校验失败：$reason，已自动重试")
 }
 
 data class DownloadResult(

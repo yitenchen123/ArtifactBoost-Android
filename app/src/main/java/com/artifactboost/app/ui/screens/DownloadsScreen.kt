@@ -125,8 +125,16 @@ fun DownloadsScreen() {
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        val queuedCount = states.values.count { it is DownloadState.Queued }
                         Text(
-                            if (activeCount > 0) "正在下载 $activeCount 个" else "全部下载",
+                            buildString {
+                                if (activeCount > 0) append("正在下载 $activeCount 个")
+                                if (queuedCount > 0) {
+                                    if (isNotEmpty()) append(" · ")
+                                    append("$queuedCount 个排队")
+                                }
+                                if (isEmpty()) append("全部下载")
+                            },
                             fontSize = 12.sp,
                             color = colors.muted,
                         )

@@ -19,6 +19,7 @@ import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Inventory2
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -218,6 +219,10 @@ fun DownloadItemRow(
 
             is DownloadState.Downloading -> {
                 DownloadingSection(item = item, progress = state.progress, summary = summary)
+            }
+
+            is DownloadState.Queued -> {
+                QueuedSection(item = item)
             }
 
             is DownloadState.Paused -> {
@@ -539,6 +544,35 @@ private fun PausedSection(
             ) {
                 Text("取消", fontSize = 13.sp, fontWeight = FontWeight.Bold)
             }
+        }
+    }
+}
+
+/** 排队中：达到同时下载数上限后等待补位 */
+@Composable
+private fun QueuedSection(item: DownloadItem) {
+    val colors = AppTheme.colors
+    val downloads = ArtifactBoostApp.instance.downloads
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Icon(
+            Icons.Filled.Schedule,
+            contentDescription = null,
+            tint = colors.orange,
+            modifier = Modifier.size(16.dp),
+        )
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("排队中", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = colors.strongText)
+            Text("前面的下载完成后自动开始", fontSize = 10.sp, color = colors.subtle)
+        }
+        Spacer(Modifier.weight(1f))
+        TextButton(
+            onClick = { downloads.cancel(item) },
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+        ) {
+            Text("取消", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = colors.red)
         }
     }
 }
